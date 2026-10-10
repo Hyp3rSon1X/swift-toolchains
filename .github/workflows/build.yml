@@ -104,8 +104,9 @@ jobs:
           curl -fsSL -o "$base.tar.gz" "$url"
           curl -fsSL -o "$base.tar.gz.sig" "$url.sig"
           # gpg --import exits 2 when any key in the bundle is expired/revoked; the --verify below is the real check.
-          curl -fsSL https://www.swift.org/keys/all-keys.asc -o swift-keys.asc
-          gpg --batch --import swift-keys.asc || echo "gpg import exit $? (expected with expired keys)"
+          # Vendored key bundle (keys/swift-all-keys.asc from https://www.swift.org/keys/all-keys.asc): the live
+          # URL serves gzip-encoded bytes even without Accept-Encoding, which gpg rejects.
+          gpg --batch --import keys/swift-all-keys.asc || echo "gpg import exit $? (expected with expired keys)"
           gpg --batch --verify "$base.tar.gz.sig" "$base.tar.gz"
           tar xzf "$base.tar.gz"
           cp -a overlay/usr/. "$base/usr/"
