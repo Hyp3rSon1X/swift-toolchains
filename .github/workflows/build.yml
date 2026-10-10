@@ -1,0 +1,237 @@
+name: build
+
+# Overlay release: rebuild patched components against the official Swift release, verify them,
+# then (publish only) push images to GHCR and attach tarballs to a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release id (file releases/<id>.env); empty = newest"
+        required: false
+        default: ""
+      publish:
+        description: "Push images and create the GitHub release"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["releases/**", "overlays/**", "tests/**", "docker/**", ".github/workflows/build.yml"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.release }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/hyp3rson1x/swift
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      id: ${{ steps.r.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: r
+        run: |
+          id="${{ inputs.release }}"
+          [ -n "$id" ] || id=$(ls releases/*.env | sed 's#releases/##; s#\.env$##' | sort -V | tail -1)
+          [ -f "releases/$id.env" ] || { echo "::error::no releases/$id.env"; exit 1; }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          cat "releases/$id.env"
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LIBDISPATCH_REPO }}
+          ref: ${{ env.LIBDISPATCH_REF }}
+          path: src/libdispatch
+      - name: Build libdispatch overlay
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/libdispatch/build.sh /w/src/libdispatch /w/out
+      - name: Test (reproducer stock vs patched, SwiftPM smoke)
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0001-libdispatch-epollhup/run.sh /w/out | tee test.log
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### ${{ matrix.arch }}"; echo '```'; cat out/MANIFEST-libdispatch.txt 2>/dev/null; grep -E '^(stock|patched|swift build|SUMMARY)' test.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlay-${{ matrix.arch }}
+          path: out/
+          retention-days: 3
+
+  package:
+    needs: [meta, build]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04,     dlpath: ubuntu2404,         suffix: ubuntu24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, dlpath: ubuntu2404-aarch64, suffix: ubuntu24.04-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: overlay-${{ matrix.arch }}
+          path: overlay
+      - name: Official toolchain (signature-verified) + overlay
+        run: |
+          set -euo pipefail
+          base="swift-${SWIFT_VERSION}-RELEASE-${{ matrix.suffix }}"
+          url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${{ matrix.dlpath }}/swift-${SWIFT_VERSION}-RELEASE/$base.tar.gz"
+          curl -fsSL -o "$base.tar.gz" "$url"
+          curl -fsSL -o "$base.tar.gz.sig" "$url.sig"
+          curl -fsSL https://swift.org/keys/all-keys.asc | gpg --import - 2>/dev/null
+          gpg --verify "$base.tar.gz.sig" "$base.tar.gz"
+          tar xzf "$base.tar.gz"
+          cp -a overlay/usr/. "$base/usr/"
+          name="swift-${RELEASE_ID}-${{ matrix.suffix }}"
+          mv "$base" "$name"
+          cp overlay/MANIFEST-*.txt "$name/"
+          mkdir -p dist
+          tar czf "dist/$name.tar.gz" "$name"
+          tar czf "dist/swift-${RELEASE_ID}-overlay-${{ matrix.suffix }}.tar.gz" -C overlay usr $(cd overlay && ls MANIFEST-*.txt)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          retention-days: 3
+          compression-level: 0
+
+  image:
+    needs: [meta, build]
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04,     platform: linux/amd64 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, platform: linux/arm64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: overlay-${{ matrix.arch }}
+          path: overlay
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push by digest
+        run: |
+          set -euo pipefail
+          mkdir -p digests
+          for v in full slim; do
+            if [ $v = full ]; then base="$BASE_IMAGE"; df=docker/Dockerfile; else base="$BASE_IMAGE_SLIM"; df=docker/Dockerfile.slim; fi
+            docker buildx build --platform ${{ matrix.platform }} -f $df --build-arg BASE="$base" \
+              --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
+              --label org.opencontainers.image.description="Swift ${SWIFT_VERSION} with backported fixes (${RELEASE_ID})" \
+              --label org.opencontainers.image.version="${RELEASE_ID}" \
+              --label dev.hyp3r.swift.base="$base" \
+              --metadata-file meta-$v.json \
+              --output type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true .
+            jq -r '."containerimage.digest"' meta-$v.json > digests/$v-${{ matrix.arch }}
+          done
+          cat digests/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/
+          retention-days: 1
+
+  publish:
+    needs: [meta, package, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: digests
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Multi-arch manifests
+        run: |
+          set -euo pipefail
+          for v in full slim; do
+            sfx=""; [ $v = slim ] && sfx="-slim"
+            docker buildx imagetools create \
+              -t "${IMAGE}:${RELEASE_ID}-noble${sfx}" \
+              -t "${IMAGE}:${SWIFT_VERSION}-noble${sfx}" \
+              "${IMAGE}@$(cat digests/$v-x86_64)" "${IMAGE}@$(cat digests/$v-aarch64)"
+            docker buildx imagetools inspect "${IMAGE}:${RELEASE_ID}-noble${sfx}"
+          done
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          cat > notes.md <<EOF
+          Swift ${SWIFT_VERSION} (official release) with backported fixes. Linux only for this release.
+
+          **Fixes**
+          - ${FIXES}
+
+          **Docker** (drop-in for \`swift:${SWIFT_VERSION}-noble\` / \`-noble-slim\`, amd64 + arm64)
+          - \`${IMAGE}:${RELEASE_ID}-noble\`, \`${IMAGE}:${RELEASE_ID}-noble-slim\`
+          - moving tags: \`${IMAGE}:${SWIFT_VERSION}-noble\`, \`${IMAGE}:${SWIFT_VERSION}-noble-slim\`
+
+          **Tarballs**
+          - \`swift-${RELEASE_ID}-ubuntu24.04[-aarch64].tar.gz\`: full official toolchain (signature-verified) with the patched libraries.
+          - \`swift-${RELEASE_ID}-overlay-*.tar.gz\`: only the patched files; extract over an existing ${SWIFT_VERSION} install root (\`tar xzf ... -C /\` for /usr installs).
+
+          Statically linked binaries (\`--static-swift-stdlib\`) must be rebuilt to pick up fixes in static libraries.
+          Source: ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}
+          EOF
+          gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS \
+            -R "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Swift ${RELEASE_ID}" --notes-file notes.md

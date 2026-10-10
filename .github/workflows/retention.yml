@@ -1,0 +1,92 @@
+# Weekly retention sweep for the build repo. Copy to .github/workflows/retention.yml.
+# Limits come from docs/RETENTION.md; change them there first.
+name: retention
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be deleted"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: write
+  packages: write
+
+concurrency:
+  group: retention
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REPO: ${{ github.repository }}
+  DRY: ${{ inputs.dry_run && 'true' || 'false' }}
+  KEEP_RELEASES_PER_LINE: 3      # per upstream base, e.g. swift-6.4.0-hyp3r.*
+  KEEP_PRERELEASES_DAYS: 14      # nightly/test pre-releases
+  CACHE_MAX_AGE_DAYS: 5          # GitHub evicts at 7 days unused; we go earlier
+  KEEP_IMAGE_VERSIONS: 6         # per GHCR package, tagged
+  RUNS_MAX_AGE_DAYS: 30          # workflow runs (logs) older than this are deleted
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Caches older than CACHE_MAX_AGE_DAYS (last access)
+        run: |
+          cutoff=$(date -u -d "-${CACHE_MAX_AGE_DAYS} days" +%s)
+          gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+            -q '.actions_caches[] | "\(.id) \(.last_accessed_at) \(.size_in_bytes) \(.key)"' |
+          while read -r id last size key; do
+            if [ "$(date -u -d "$last" +%s)" -lt "$cutoff" ]; then
+              echo "cache $id $key ($((size/1048576)) MiB, last $last)"
+              [ "$DRY" = true ] || gh api -X DELETE "repos/$REPO/actions/caches/$id" >/dev/null
+            fi
+          done
+
+      - name: Old pre-releases, and releases beyond KEEP_RELEASES_PER_LINE per line
+        run: |
+          cutoff=$(date -u -d "-${KEEP_PRERELEASES_DAYS} days" +%s)
+          gh api --paginate "repos/$REPO/releases?per_page=100" \
+            -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)"' > releases.tsv
+          # pre-releases by age
+          while IFS=$'\t' read -r id tag pre created; do
+            if [ "$pre" = true ] && [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ]; then
+              echo "pre-release $tag ($created)"
+              [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+            fi
+          done < releases.tsv
+          # full releases: keep newest N per line (tag minus the trailing .<n>)
+          awk -F'\t' '$3=="false"' releases.tsv | sort -t$'\t' -k4,4r |
+          awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/\.[0-9]+$/,"",line); if (++seen[line] > keep) print $2}' |
+          while read -r tag; do
+            echo "release $tag (beyond newest $KEEP_RELEASES_PER_LINE of its line)"
+            [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+          done
+
+      - name: Workflow runs older than RUNS_MAX_AGE_DAYS
+        run: |
+          cutoff=$(date -u -d "-${RUNS_MAX_AGE_DAYS} days" +%Y-%m-%d)
+          gh api --paginate "repos/$REPO/actions/runs?per_page=100&created=<$cutoff" -q '.workflow_runs[].id' |
+          while read -r id; do
+            echo "run $id"
+            [ "$DRY" = true ] || gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null
+          done
+
+      # dataaxiom/ghcr-cleanup-action understands multi-arch manifests; actions/delete-package-versions
+      # with delete-only-untagged-versions deletes the per-arch children of multi-arch images and breaks them.
+      - name: GHCR image versions (multi-arch aware)
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          token: ${{ github.token }}
+          package: swift
+          keep-n-tagged: ${{ env.KEEP_IMAGE_VERSIONS }}
+          exclude-tags: "latest,*-latest"
+          delete-untagged: true
+          delete-partial-images: true
+          dry-run: ${{ env.DRY }}
+        continue-on-error: true

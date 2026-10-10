@@ -1,0 +1,4 @@
+# Overlay slim (runtime) image: only the shared runtime libraries.
+ARG BASE
+FROM ${BASE}
+COPY overlay/usr/lib/swift/linux/ /usr/lib/swift/linux/
