@@ -39,6 +39,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       id: ${{ steps.r.outputs.id }}
+      static: ${{ steps.r.outputs.static }}
     steps:
       - uses: actions/checkout@v7
       - id: r
@@ -47,6 +48,8 @@ jobs:
           [ -n "$id" ] || id=$(ls releases/*.env | sed 's#releases/##; s#\.env$##' | sort -V | tail -1)
           [ -f "releases/$id.env" ] || { echo "::error::no releases/$id.env"; exit 1; }
           echo "id=$id" >> "$GITHUB_OUTPUT"
+          # Non-empty when the release also ships a patched Static Linux SDK (jobs static-sdk*).
+          echo "static=$(sed -n 's/^STATIC_SDK_VERSION=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
           cat "releases/$id.env"
 
   build:
@@ -105,6 +108,137 @@ jobs:
           name: overlay-${{ matrix.arch }}
           path: out/
           retention-days: 3
+
+  # Patched Static Linux SDK (musl): libdispatch.a and libFoundation.a rebuilt against the official bundle's sysroot.
+  # static-sdk builds natively per arch, static-sdk-bundle assembles one bundle with both arches, static-sdk-test
+  # installs official + patched bundle side by side and runs the SC-0001/SC-0002 reproducers statically linked.
+  static-sdk:
+    needs: meta
+    if: needs.meta.outputs.static != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.LIBDISPATCH_REPO }}
+          ref: ${{ env.LIBDISPATCH_REF }}
+          path: src/libdispatch
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FOUNDATION_REPO }}
+          ref: ${{ env.FOUNDATION_REF }}
+          path: src/foundation
+      - name: Fetch Foundation dependencies at the release-pinned revisions
+        run: |
+          set -euo pipefail
+          mkdir -p src/deps
+          git clone -q --depth 1 -b "$SWIFT_FOUNDATION_TAG"     https://github.com/swiftlang/swift-foundation.git     src/deps/swift-foundation
+          git clone -q --depth 1 -b "$SWIFT_FOUNDATION_ICU_TAG" https://github.com/swiftlang/swift-foundation-icu.git src/deps/swift-foundation-icu
+          git clone -q --depth 1 -b "$SWIFT_COLLECTIONS_TAG"    https://github.com/apple/swift-collections.git        src/deps/swift-collections
+      - name: Official Static Linux SDK (checksum + signature verified)
+        run: |
+          set -euo pipefail
+          mkdir -p dl sdk
+          curl -fsSL -o dl/official.tar.gz     "$STATIC_SDK_URL"
+          curl -fsSL -o dl/official.tar.gz.sig "$STATIC_SDK_URL.sig"
+          echo "$STATIC_SDK_SHA256  dl/official.tar.gz" | sha256sum -c -
+          gpg --batch --import keys/swift-all-keys.asc || echo "gpg import exit $? (expected with expired keys)"
+          gpg --batch --verify dl/official.tar.gz.sig dl/official.tar.gz
+          tar xzf dl/official.tar.gz -C sdk
+          rm -rf dl
+          ls sdk
+      - name: Build libdispatch.a and libFoundation.a (symbols must equal the official bundle's)
+        run: |
+          set -euo pipefail
+          sdkdir=$(echo sdk/*.artifactbundle/*/swift-linux-musl)
+          docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/static-sdk/build.sh ${{ matrix.arch }} "/w/$sdkdir" /w/src/libdispatch /w/src/foundation /w/src/deps /w/out 2>&1 | tee build-static-sdk.log | grep -vE 'warning|^ *[0-9]+ \||^ *[|`]|^$|^\[[0-9]+/[0-9]+\]' | tail -60
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### static SDK ${{ matrix.arch }}"; echo '```'; cat out/MANIFEST-static-sdk-*.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: static-sdk-built-${{ matrix.arch }}
+          path: out/
+          retention-days: 3
+
+  static-sdk-bundle:
+    needs: [meta, static-sdk]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: static-sdk-built-*
+          merge-multiple: true
+          path: built
+      - name: Official bundle (checksum verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o official.tar.gz "$STATIC_SDK_URL"
+          echo "$STATIC_SDK_SHA256  official.tar.gz" | sha256sum -c -
+      - name: Assemble the patched bundle
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/static-sdk/assemble.sh /w/official.tar.gz /w/built /w/dist "$RELEASE_ID" "$STATIC_SDK_VERSION" \
+            "libdispatch ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}" "foundation ${FOUNDATION_REPO}@${FOUNDATION_REF}" \
+            "swift-foundation ${SWIFT_FOUNDATION_TAG}, swift-foundation-icu ${SWIFT_FOUNDATION_ICU_TAG}, swift-collections ${SWIFT_COLLECTIONS_TAG}"
+          { echo "### static SDK bundle"; echo '```'; cat dist/MANIFEST-static-sdk.txt; echo "checksum: $(cat dist/*.checksum)"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: static-sdk-bundle
+          path: dist/
+          retention-days: 3
+          compression-level: 0
+      - uses: actions/upload-artifact@v7
+        with:
+          name: static-sdk-official
+          path: official.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  static-sdk-test:
+    needs: [meta, static-sdk-bundle]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v8
+        with:
+          name: static-sdk-bundle
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: static-sdk-official
+          path: official
+      - name: Build the reproducers statically against the official and the patched SDK
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/static-sdk/build-repros.sh /w/official/official.tar.gz /w/dist/swift-${RELEASE_ID}_static-linux-${STATIC_SDK_VERSION}.artifactbundle.tar.gz ${{ matrix.arch }} /w/repro-bin
+      - name: Run them in a plain container (no Swift installed)
+        run: docker run --rm -v "$PWD/repro-bin:/b:ro" -v "$PWD/tests/static-sdk:/t:ro" ubuntu:24.04 bash /t/run-repros.sh /b 8 | tee test-static-sdk.log
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### static SDK reproducers ${{ matrix.arch }}"; echo '```'; grep -hE '^(sc000|SUMMARY)' test-static-sdk.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   package:
     needs: [meta, build]
@@ -204,7 +338,9 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [meta, package, image]
+    needs: [meta, package, image, static-sdk-test]
+    # static-sdk-test is skipped for releases without STATIC_SDK_VERSION; a skipped need must not skip the publish.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -224,6 +360,11 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@v8
+        if: needs.meta.outputs.static != ''
+        with:
+          name: static-sdk-bundle
+          path: dist-sdk
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -247,6 +388,15 @@ jobs:
         run: |
           set -euo pipefail
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          sdk_files=()
+          if [ -n "${STATIC_SDK_VERSION:-}" ]; then
+            sdk_files=(dist-sdk/*.artifactbundle.tar.gz dist-sdk/*.checksum dist-sdk/MANIFEST-static-sdk.txt)
+            sdk_name=$(basename dist-sdk/*.artifactbundle.tar.gz)
+            sdk_note="
+          **Static Linux SDK (musl)**: \`${sdk_name}\`, the official ${SWIFT_VERSION} SDK with libdispatch.a and libFoundation.a rebuilt from the fixes (for \`--swift-sdk\` builds). Checksum: \`$(cat dist-sdk/*.checksum)\`.
+          \`swift sdk install https://github.com/${{ github.repository }}/releases/download/swift-${RELEASE_ID}/${sdk_name} --checksum $(cat dist-sdk/*.checksum)\`
+          "
+          fi
           cat > notes.md <<EOF
           Swift ${SWIFT_VERSION} (official release) with backported fixes. Linux only for this release.
 
@@ -262,9 +412,10 @@ jobs:
           - \`swift-${RELEASE_ID}-overlay-*.tar.gz\`: only the patched files; extract over an existing ${SWIFT_VERSION} install root (\`tar xzf ... -C /\` for /usr installs).
 
           Statically linked binaries (\`--static-swift-stdlib\`) must be rebuilt to pick up fixes in static libraries.
+          ${sdk_note:-}
           Source: ${LIBDISPATCH_REPO:+libdispatch ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}} ${FOUNDATION_REPO:+foundation ${FOUNDATION_REPO}@${FOUNDATION_REF}}
           EOF
-          gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS "${sdk_files[@]}" \
             -R "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "Swift ${RELEASE_ID}" --notes-file notes.md
 
