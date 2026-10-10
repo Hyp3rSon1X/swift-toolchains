@@ -21,6 +21,10 @@ concurrency:
   group: mirror
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   mirror:
     runs-on: ubuntu-24.04

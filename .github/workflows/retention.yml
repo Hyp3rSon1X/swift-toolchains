@@ -31,6 +31,10 @@ env:
   KEEP_IMAGE_VERSIONS: 6         # per GHCR package, tagged
   RUNS_MAX_AGE_DAYS: 30          # workflow runs (logs) older than this are deleted
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   sweep:
     runs-on: ubuntu-24.04

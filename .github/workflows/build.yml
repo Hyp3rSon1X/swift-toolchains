@@ -25,6 +25,11 @@ concurrency:
   group: build-${{ github.ref }}-${{ inputs.release }}
   cancel-in-progress: true
 
+# Explicit bash = -eo pipefail, so `docker run ... | tee` fails when the test fails.
+defaults:
+  run:
+    shell: bash
+
 env:
   IMAGE: ghcr.io/hyp3rson1x/swift
 
