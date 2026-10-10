@@ -40,6 +40,7 @@ jobs:
     outputs:
       id: ${{ steps.r.outputs.id }}
       static: ${{ steps.r.outputs.static }}
+      compiler: ${{ steps.r.outputs.compiler }}
     steps:
       - uses: actions/checkout@v7
       - id: r
@@ -50,6 +51,8 @@ jobs:
           echo "id=$id" >> "$GITHUB_OUTPUT"
           # Non-empty when the release also ships a patched Static Linux SDK (jobs static-sdk*).
           echo "static=$(sed -n 's/^STATIC_SDK_VERSION=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
+          # Non-empty when the release ships a rebuilt swift-frontend (jobs compiler-*).
+          echo "compiler=$(sed -n 's/^SWIFT_REF=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
           cat "releases/$id.env"
 
   build:
@@ -240,9 +243,123 @@ jobs:
         run: |
           { echo "### static SDK reproducers ${{ matrix.arch }}"; echo '```'; grep -hE '^(sc000|SUMMARY)' test-static-sdk.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+  # Compiler overlay (SC-0004): swift-frontend rebuilt from the patched swift tree and the swift-6.4.0-RELEASE
+  # LLVM/Clang trees inside the official image, then swapped into the official toolchain. Two chained jobs per arch
+  # because the LLVM/Clang libraries alone take more than half the 6 h job cap on a 4-core runner; the build tree of the
+  # first stage (objects removed) travels as a 1-day artifact.
+  compiler-llvm:
+    needs: meta
+    if: needs.meta.outputs.compiler != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          df -h / | tail -1
+      - name: Fetch sources
+        run: overlays/swift-frontend/fetch.sh "$PWD/ws" "$SWIFT_REPO" "$SWIFT_REF" "$SWIFT_UPSTREAM_TAG"
+      - name: Build LLVM and Clang libraries
+        run: |
+          start=$(date +%s)
+          docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/swift-frontend/build.sh llvm /w/ws /w/build /w/out 2>&1 | tee build-llvm.log | grep -E '^\[[0-9]+/[0-9]+\]|^llvm stage|error' | awk 'NR%200==1 || /error/' | tail -150
+          echo "llvm stage seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h / | tail -1
+      - name: Pack the LLVM build tree (no object files)
+        run: |
+          set -euo pipefail
+          sudo chown -R "$USER" build
+          tar -C build -cf - --exclude='*.o' --exclude='*.o.d' --exclude='.ninja_*' llvm cmark | zstd -T0 -3 -o llvm-stage.tar.zst
+          ls -la llvm-stage.tar.zst | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compiler-llvm-${{ matrix.arch }}
+          path: llvm-stage.tar.zst
+          retention-days: 1
+          compression-level: 0
+
+  compiler-swift:
+    needs: [meta, compiler-llvm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          df -h / | tail -1
+      - name: Fetch sources
+        run: overlays/swift-frontend/fetch.sh "$PWD/ws" "$SWIFT_REPO" "$SWIFT_REF" "$SWIFT_UPSTREAM_TAG"
+      - uses: actions/download-artifact@v8
+        with:
+          name: compiler-llvm-${{ matrix.arch }}
+          path: stage
+      - name: Unpack the LLVM build tree
+        run: |
+          set -euo pipefail
+          mkdir build
+          zstd -dc stage/llvm-stage.tar.zst | tar -C build -xf -
+          rm -rf stage
+          df -h / | tail -1
+      - name: Build swift-frontend
+        run: |
+          start=$(date +%s)
+          docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/swift-frontend/build.sh swift /w/ws /w/build /w/out 2>&1 | tee build-swift.log | grep -E '^\[[0-9]+/[0-9]+\]|error|^(component|swift|llvm-project|cmark|version|size|NEEDED|arch|host)|usr/bin' | awk 'NR%100==1 || !/^\[/' | tail -150
+          echo "swift stage seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          test -x out/usr/bin/swift-frontend
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compiler-${{ matrix.arch }}
+          path: out/
+          retention-days: 3
+          compression-level: 6
+
+  compiler-test:
+    needs: [meta, compiler-swift]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v8
+        with:
+          name: compiler-${{ matrix.arch }}
+          path: compiler
+      - name: Test the swapped frontend (reproducers stock vs patched, SwiftPM smoke)
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0004-field-offset/run.sh /w/compiler | tee test-compiler.log
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   package:
-    needs: [meta, build]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [meta, build, compiler-test]
+    # compiler-test is skipped for releases without SWIFT_REF; a skipped need must not skip the package.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish }}
     strategy:
       fail-fast: false
       matrix:
@@ -258,6 +375,11 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: overlay-${{ matrix.arch }}
+          path: overlay
+      - uses: actions/download-artifact@v8
+        if: needs.meta.outputs.compiler != ''
+        with:
+          name: compiler-${{ matrix.arch }}
           path: overlay
       - name: Official toolchain (signature-verified) + overlay
         run: |
@@ -288,8 +410,8 @@ jobs:
           compression-level: 0
 
   image:
-    needs: [meta, build]
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [meta, build, compiler-test]
+    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish }}
     permissions:
       contents: read
       packages: write
@@ -308,6 +430,11 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: overlay-${{ matrix.arch }}
+          path: overlay
+      - uses: actions/download-artifact@v8
+        if: needs.meta.outputs.compiler != ''
+        with:
+          name: compiler-${{ matrix.arch }}
           path: overlay
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
