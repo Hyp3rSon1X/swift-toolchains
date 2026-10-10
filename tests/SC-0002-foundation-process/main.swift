@@ -21,9 +21,14 @@ guard args.count >= 4, let openFDs = Int(args[1]), let launches = Int(args[2]), 
 let verifyEvery = args.count > 4 ? Int(args[4]) ?? 50 : 50
 
 var lim = rlimit()
-getrlimit(__rlimit_resource_t(RLIMIT_NOFILE.rawValue), &lim)
+#if canImport(Musl)
+let nofile = RLIMIT_NOFILE  // musl declares the resource as a plain Int32
+#else
+let nofile = __rlimit_resource_t(RLIMIT_NOFILE.rawValue)
+#endif
+getrlimit(nofile, &lim)
 lim.rlim_cur = lim.rlim_max
-setrlimit(__rlimit_resource_t(RLIMIT_NOFILE.rawValue), &lim)
+setrlimit(nofile, &lim)
 
 var held = [Int32]()
 for _ in 0..<openFDs {

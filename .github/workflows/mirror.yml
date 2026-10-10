@@ -36,7 +36,7 @@ jobs:
       NS: swift-toolchains
       KEEP_RELEASES: 3
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ inputs.release }}"
       - name: Log in
