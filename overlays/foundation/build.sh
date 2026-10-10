@@ -53,8 +53,8 @@ install -m 0755 "$so" "$OUT/usr/lib/swift/linux/libFoundation.so"
 install -m 0644 "$a"  "$OUT/usr/lib/swift_static/linux/libFoundation.a"
 {
   echo "component: foundation (swift-corelibs-foundation: libFoundation.so, libFoundation.a)"
-  echo "source: $(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
-  for d in swift-foundation swift-foundation-icu swift-collections; do echo "dep $d: $(git -C "$DEPS/$d" rev-parse HEAD 2>/dev/null || echo unknown)"; done
+  echo "source: $(git -c safe.directory="*" -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+  for d in swift-foundation swift-foundation-icu swift-collections; do echo "dep $d: $(git -c safe.directory="*" -C "$DEPS/$d" rev-parse HEAD 2>/dev/null || echo unknown)"; done
   echo "arch: $(uname -m)"
   echo "compiler: $(clang --version | head -1); $(swiftc --version 2>&1 | head -1)"
   echo "shared symbols: $(wc -l < "$OUT/checks/foundation-shared-built.txt") (identical to stock)"
