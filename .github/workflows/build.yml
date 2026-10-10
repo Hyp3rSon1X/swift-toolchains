@@ -273,3 +273,4 @@ jobs:
     uses: ./.github/workflows/mirror.yml
     with:
       release: ${{ needs.meta.outputs.id }}
+    secrets: inherit   # needed so the called job can read the publish environment's secrets
