@@ -238,3 +238,9 @@ jobs:
           gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS \
             -R "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "Swift ${RELEASE_ID}" --notes-file notes.md
+
+  mirror:
+    needs: [meta, publish]
+    uses: ./.github/workflows/mirror.yml
+    with:
+      release: ${{ needs.meta.outputs.id }}

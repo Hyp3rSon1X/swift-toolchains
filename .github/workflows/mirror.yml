@@ -1,0 +1,88 @@
+name: mirror
+
+# Copies a published release's images from GHCR to the self-hosted registry (digests preserved) and
+# keeps only the newest KEEP_RELEASES releases there. Runs after `build` publishes, or by hand.
+on:
+  workflow_call:
+    inputs:
+      release:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release id (file releases/<id>.env)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: publish          # secrets live here; deployable from main only
+    env:
+      SRC: ghcr.io/hyp3rson1x
+      REG: registry.hyp3r.dev
+      NS: swift-toolchains
+      KEEP_RELEASES: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ inputs.release }}"
+      - name: Log in
+        env:
+          U: ${{ secrets.HYP3R_REGISTRY_USER }}
+          P: ${{ secrets.HYP3R_REGISTRY_PASSWORD }}
+        run: |
+          printf %s "$P" | skopeo login --username "$U" --password-stdin "$REG"
+          printf '%s:%s' "$U" "$P" > "$RUNNER_TEMP/reg-auth" && chmod 600 "$RUNNER_TEMP/reg-auth"
+      - name: Copy images (all architectures, digests preserved)
+        run: |
+          set -euo pipefail
+          # GHCR tag suffix -> mirror repository
+          for pair in ":swift" "-slim:swift-slim"; do
+            sfx="${pair%%:*}"; repo="${pair#*:}"
+            for tag in "${RELEASE_ID}-noble" "${SWIFT_VERSION}-noble"; do
+              skopeo copy --all --preserve-digests --retry-times 3 \
+                "docker://${SRC}/swift:${tag}${sfx}" "docker://${REG}/${NS}/${repo}:${tag}"
+              skopeo inspect --raw "docker://${REG}/${NS}/${repo}:${tag}" > m.json
+              echo "${REG}/${NS}/${repo}:${tag} $(skopeo manifest-digest m.json)"
+            done
+          done | tee mirrored.txt
+          { echo "### Mirrored"; echo '```'; cat mirrored.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Prune to the newest KEEP_RELEASES releases
+        run: |
+          set -euo pipefail
+          auth="$(cat "$RUNNER_TEMP/reg-auth")"
+          accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          digest() { curl -fsS -I -u "$auth" -H "Accept: $accept" "https://${REG}/v2/${NS}/$1/manifests/$2" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p'; }
+          for repo in swift swift-slim; do
+            tags=$(curl -fsS -u "$auth" "https://${REG}/v2/${NS}/${repo}/tags/list" | jq -r '.tags[]?')
+            ids=$(printf '%s\n' "$tags" | sed -n 's/^\(.*-hyp3r\.[0-9][0-9]*\)-noble$/\1/p' | sort -V)
+            keep=$(printf '%s\n' "$ids" | tail -n "$KEEP_RELEASES")
+            old=$(printf '%s\n' "$ids" | head -n -"$KEEP_RELEASES" || true)
+            # digests that must survive: kept releases + every non-release (moving) tag
+            protect=""
+            for t in $tags; do
+              id="${t%-noble}"
+              if ! printf '%s\n' "$ids" | grep -qx "$id" || printf '%s\n' "$keep" | grep -qx "$id"; then
+                protect="$protect $(digest "$repo" "$t")"
+              fi
+            done
+            for id in $old; do
+              d=$(digest "$repo" "${id}-noble")
+              if printf '%s\n' $protect | grep -qx "$d"; then echo "$repo:${id}-noble shares a kept digest, skipped"; continue; fi
+              echo "delete $repo:${id}-noble ($d)"
+              curl -fsS -u "$auth" -X DELETE "https://${REG}/v2/${NS}/${repo}/manifests/${d}" -o /dev/null
+            done
+            echo "$repo keeps: $(echo $keep)"
+          done
+      - name: Log out
+        if: always()
+        run: skopeo logout "$REG" || true; rm -f "$RUNNER_TEMP/reg-auth"
