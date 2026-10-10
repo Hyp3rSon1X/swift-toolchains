@@ -3,4 +3,4 @@
 set -euo pipefail
 f="releases/$1.env"
 set -a; . "$f"; set +a
-for k in $(grep -oE '^[A-Z_]+' "$f"); do printf '%s=%s\n' "$k" "${!k}"; done >> "$GITHUB_ENV"
+for k in $(grep -oE '^[A-Z][A-Z0-9_]*' "$f"); do printf '%s=%s\n' "$k" "${!k}"; done >> "$GITHUB_ENV"
