@@ -11,7 +11,8 @@ swiftc -O -static-stdlib "$here/main.swift" -o /tmp/repro-static || exit 1   # l
 
 vg() {  # vg <binary>: count valgrind "Invalid read"s attributed to findMaximumOpenFromProcSelfFD (40 s cap)
   timeout -s KILL 40 valgrind -q --num-callers=4 "$1" 1500 1 1 1 > /tmp/vg.out 2>&1
-  grep -A1 'Invalid read' /tmp/vg.out | grep -c findMaximumOpenFromProcSelfFD
+  echo "valgrind $1: $(wc -l < /tmp/vg.out) output lines, first: $(head -c 300 /tmp/vg.out | tr '\n' ' ')" >&2
+  grep -A3 'Invalid read' /tmp/vg.out | grep -c findMaximumOpenFromProcSelfFD
 }
 
 stock_fail=0
