@@ -19,13 +19,13 @@ rm -rf "$W" "$R" "$TAR" "$PKG"; mkdir -p "$W" "$R"
 trap 'rm -rf "$W" "$R"' EXIT
 
 # Tarball: no AppleDouble/xattr entries; code signatures live inside the Mach-Os and _CodeSignature.
-(cd "$OUT" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -cf - "$NAME.xctoolchain") | xz -T8 -6 > "$TAR"
+(cd "$OUT" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -cf - "$NAME.xctoolchain") | nice -n 10 xz -T6 -6 > "$TAR"
 
 # Component package. The bundle must not be relocatable, or Installer moves it onto any copy it finds.
 cp -c -R "$TC" "$R/" 2>/dev/null || ditto "$TC" "$R/$NAME.xctoolchain"
 pkgbuild --analyze --root "$R" "$W/component.plist"
 plutil -replace 0.BundleIsRelocatable -bool NO "$W/component.plist"
-pkgbuild --root "$R" --component-plist "$W/component.plist" --identifier "$ID" --version "$VERSION" \
+nice -n 10 pkgbuild --root "$R" --component-plist "$W/component.plist" --identifier "$ID" --version "$VERSION" \
   --install-location /Library/Developer/Toolchains "$W/$NAME.pkg"
 cat > "$W/distribution.xml" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -39,7 +39,7 @@ cat > "$W/distribution.xml" <<EOF
   <pkg-ref id="$ID" version="$VERSION" onConclusion="none">$NAME.pkg</pkg-ref>
 </installer-gui-script>
 EOF
-productbuild --distribution "$W/distribution.xml" --package-path "$W" "$PKG"
+nice -n 10 productbuild --distribution "$W/distribution.xml" --package-path "$W" "$PKG"
 
 (cd "$OUT" && shasum -a 256 "$(basename "$TAR")" "$(basename "$PKG")" > SHA256SUMS && cat SHA256SUMS)
 ls -l "$TAR" "$PKG"

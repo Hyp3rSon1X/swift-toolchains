@@ -2,54 +2,74 @@
 # Usage: assemble-toolchain.sh <base.xctoolchain> <swift build dir> <out-dir> <release-id> <version> <display-suffix>
 #   e.g. assemble-toolchain.sh ~/Library/Developer/Toolchains/swift-6.4.0-RELEASE.xctoolchain \
 #          <build-script build>/swift-macosx-arm64 build/macos-toolchain 6.4.0-hyp3r.4 6.4.20261010104 "SC-0004"
-# Produces <out-dir>/swift-<release-id>.xctoolchain: a copy of the official swift.org toolchain in which only the
-# compiler frontend is replaced: usr/bin/swift-frontend plus, in the new directory usr/lib/swift/host/compiler-hyp3r,
-# the compiler's own swift-syntax libraries (lib_CompilerSwift*.dylib) from the same build. The frontend's rpath
-# is pointed at that directory. Why: a frontend built by a different host Swift compiler than swift.org's does not
-# link against the official lib_CompilerSwift*.dylib (it expects weak-def exports they lack), while LLDB,
-# sourcekitd and the scanner library must keep loading the official copies in usr/lib/swift/host/compiler.
-# Binaries are stripped like build-script's darwin-install-extract-symbols does and signed ad hoc. The bundle
+# Produces <out-dir>/swift-<release-id>.xctoolchain: a copy of the official swift.org toolchain in which only
+# usr/bin/swift-frontend is replaced. The new frontend runs against the toolchain's official
+# usr/lib/swift/host/compiler/lib_CompilerSwift*.dylib (same rpaths as the official frontend).
+#
+# Relink: the frontend's final link is redone (from `ninja -t commands`) against the base toolchain's
+# lib_CompilerSwift*.dylib instead of the ones in the build tree. The code is unchanged; only the binding of
+# imports changes. Why: the build tree's swift-syntax libraries come from the same source tag, but a newer host
+# Swift compiler emits some of their exports as weak definitions (e.g. SyntaxRewriter.visitImpl). ld then
+# records a <weak-def-coalesce> bind in the frontend, which dyld cannot satisfy from the official dylibs, where
+# the same symbol is a regular export ("Symbol not found ... Expected as weak-def export").
+#
+# The result is stripped like build-script's darwin-install-extract-symbols does and signed ad hoc. The bundle
 # gets the identifier dev.hyp3r.swift.<release-id>, so it installs next to the official one and is selected with
 # TOOLCHAINS=dev.hyp3r.swift.<release-id>; Aliases is emptied, the toolchain never claims "swift". The base
 # toolchain is only read. The bundle seal is redone ad hoc; untouched binaries keep their Developer ID signatures.
 set -euo pipefail
-[ $# -eq 6 ] || { sed -n '2,16p' "$0"; exit 2; }
-BASE="${1%/}"; BUILD="${2%/}"; FRONTEND="$BUILD/bin/swift-frontend"; mkdir -p "$3"; OUT="$(cd "$3" && pwd)"; RELEASE_ID="$4"; VERSION="$5"; SUFFIX="$6"
+[ $# -eq 6 ] || { sed -n '2,20p' "$0"; exit 2; }
+BASE="$(cd "$1" && pwd)"; BUILD="$(cd "$2" && pwd)"; mkdir -p "$3"; OUT="$(cd "$3" && pwd)"
+RELEASE_ID="$4"; VERSION="$5"; SUFFIX="$6"
 SWIFT_VERSION="${RELEASE_ID%%-*}"
 ID="dev.hyp3r.swift.${RELEASE_ID}"
 TC="$OUT/swift-${RELEASE_ID}.xctoolchain"
+HOSTLIB=lib/swift/host/compiler
 
 [ -f "$BASE/Info.plist" ] && [ -x "$BASE/usr/bin/swift-frontend" ] || { echo "error: $BASE is not a toolchain" >&2; exit 1; }
-[ -x "$FRONTEND" ] || { echo "error: no executable $FRONTEND" >&2; exit 1; }
+[ -x "$BUILD/bin/swift-frontend" ] || { echo "error: no $BUILD/bin/swift-frontend; run ninja swift-frontend" >&2; exit 1; }
 [ ! -e "$TC" ] || { echo "error: $TC exists; remove it first" >&2; exit 1; }
 
-base_archs=$(lipo -archs "$BASE/usr/bin/swift-frontend"); new_archs=$(lipo -archs "$FRONTEND")
+# Relink against the official compiler libraries (see above).
+RELINKED="$BUILD/bin/swift-frontend.relinked"
+cmd=$(cd "$BUILD" && ninja -t commands bin/swift-frontend | tail -1)
+grep -q -- " -o bin/swift-frontend " <<<"$cmd" || { echo "error: unexpected link command" >&2; exit 1; }
+n=$(grep -o " $HOSTLIB/lib_CompilerSwift[A-Za-z]*\.dylib" <<<"$cmd" | wc -l)
+[ "$n" -gt 0 ] || { echo "error: link command has no $HOSTLIB/lib_CompilerSwift*.dylib" >&2; exit 1; }
+cmd=$(sed -e "s# $HOSTLIB/lib_CompilerSwift\([A-Za-z]*\)\.dylib# $BASE/usr/$HOSTLIB/lib_CompilerSwift\1.dylib#g" \
+          -e "s# -o bin/swift-frontend # -o bin/swift-frontend.relinked #" <<<"$cmd")
+for l in $(grep -o "$BASE/usr/$HOSTLIB/lib_CompilerSwift[A-Za-z]*\.dylib" <<<"$cmd"); do
+  [ -f "$l" ] || { echo "error: base toolchain lacks $l" >&2; exit 1; }
+done
+(cd "$BUILD" && rm -f "$RELINKED" && nice -n 10 bash -c "$cmd")
+echo "relinked against $n official libraries"
+
+base_archs=$(lipo -archs "$BASE/usr/bin/swift-frontend"); new_archs=$(lipo -archs "$RELINKED")
 echo "base swift-frontend: $base_archs; new: $new_archs"
 [ "$base_archs" = "$new_archs" ] || echo "warning: the toolchain will only run on: $new_archs"
 
 ditto "$BASE" "$TC"
 
-# Install the frontend and its swift-syntax libraries. The usr/bin tools that are symlinks to swift-frontend
-# (swift-legacy-driver, swift-symbolgraph-extract, ...) follow automatically.
-HOSTDIR=lib/swift/host
-LIBS=("$BUILD/$HOSTDIR/compiler"/lib_CompilerSwift*.dylib)
-[ -f "${LIBS[0]}" ] || { echo "error: no lib_CompilerSwift*.dylib in $BUILD/$HOSTDIR/compiler" >&2; exit 1; }
-CD="$TC/usr/$HOSTDIR/compiler-hyp3r"
-mkdir "$CD"
-cp "${LIBS[@]}" "$CD/"
+# Install the frontend. The usr/bin tools that are symlinks to swift-frontend (swift-legacy-driver,
+# swift-symbolgraph-extract, ...) follow automatically.
 F="$TC/usr/bin/swift-frontend"
-cp "$FRONTEND" "$F"
-chmod 755 "$F" "$CD"/*.dylib
-install_name_tool -rpath "@executable_path/../$HOSTDIR/compiler" "@executable_path/../$HOSTDIR/compiler-hyp3r" "$F"
-for b in "$F" "$CD"/*.dylib; do
-  strip -S "$b"
-  codesign -f -s - -i "$(basename "$b" .dylib)" "$b"
-  codesign --verify --strict "$b"
-done
-# Every library the frontend needs must resolve inside the new directory.
-for l in $(otool -L "$F" | sed -n 's#^[[:space:]]*@rpath/\(lib_Compiler[^ ]*\).*#\1#p'); do
-  [ -f "$CD/$l" ] || { echo "error: $l missing in $CD" >&2; exit 1; }
-done
+mv "$RELINKED" "$F"
+chmod 755 "$F"
+strip -S "$F"
+codesign -f -s - -i swift-frontend "$F"
+codesign --verify --strict "$F"
+
+# No import may still need weak-def coalescing from the compiler libraries, and the rpaths must match the
+# official frontend's.
+if dyld_info -fixups "$F" | grep -q "<weak-def-coalesce>/_\$s[0-9]*_Compiler"; then
+  echo "error: weak-def binds to _Compiler* symbols remain" >&2; exit 1
+fi
+rp() { otool -l -arch arm64 "$1" | awk '/LC_RPATH/{getline; getline; print $2}'; }
+[ "$(rp "$F")" = "$(rp "$BASE/usr/bin/swift-frontend")" ] || { echo "error: rpaths differ from the official frontend" >&2; exit 1; }
+# Load check: every lib_Compiler* image must come from the toolchain's own host/compiler directory.
+loaded=$(DYLD_PRINT_LIBRARIES=1 "$F" -version 2>&1 >/dev/null | sed -n 's#.*> \(.*lib_Compiler[^ ]*\)$#\1#p')
+[ -n "$loaded" ] && ! grep -v "^$TC/usr/$HOSTLIB/" <<<"$loaded" || { echo "error: unexpected compiler library load" >&2; exit 1; }
+echo "loads $(wc -l <<<"$loaded" | tr -d ' ') official compiler libraries from usr/$HOSTLIB"
 
 P="$TC/Info.plist"
 plutil -replace CFBundleIdentifier -string "$ID" "$P"
@@ -66,5 +86,5 @@ codesign --verify --strict "$TC"
 
 plutil -p "$P"
 "$F" -print-target-info | grep -E '"(compilerVersion|swiftCompilerTag)"'
-shasum -a 256 "$F" "$CD"/*.dylib
+shasum -a 256 "$F"
 echo "assembled $TC"
