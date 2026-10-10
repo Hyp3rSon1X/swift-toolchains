@@ -103,8 +103,10 @@ jobs:
           url="https://download.swift.org/swift-${SWIFT_VERSION}-release/${{ matrix.dlpath }}/swift-${SWIFT_VERSION}-RELEASE/$base.tar.gz"
           curl -fsSL -o "$base.tar.gz" "$url"
           curl -fsSL -o "$base.tar.gz.sig" "$url.sig"
-          curl -fsSL https://swift.org/keys/all-keys.asc | gpg --import - 2>/dev/null
-          gpg --verify "$base.tar.gz.sig" "$base.tar.gz"
+          # gpg --import exits 2 when any key in the bundle is expired/revoked; the --verify below is the real check.
+          curl -fsSL https://www.swift.org/keys/all-keys.asc -o swift-keys.asc
+          gpg --batch --import swift-keys.asc || echo "gpg import exit $? (expected with expired keys)"
+          gpg --batch --verify "$base.tar.gz.sig" "$base.tar.gz"
           tar xzf "$base.tar.gz"
           cp -a overlay/usr/. "$base/usr/"
           name="swift-${RELEASE_ID}-${{ matrix.suffix }}"
