@@ -58,19 +58,43 @@ jobs:
       - uses: actions/checkout@v4
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      # An overlay is built and tested only when the manifest sets its *_REF (hyp3r.1 has no foundation).
       - uses: actions/checkout@v4
+        if: env.LIBDISPATCH_REF != ''
         with:
           repository: ${{ env.LIBDISPATCH_REPO }}
           ref: ${{ env.LIBDISPATCH_REF }}
           path: src/libdispatch
       - name: Build libdispatch overlay
+        if: env.LIBDISPATCH_REF != ''
         run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/libdispatch/build.sh /w/src/libdispatch /w/out
-      - name: Test (reproducer stock vs patched, SwiftPM smoke)
-        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0001-libdispatch-epollhup/run.sh /w/out | tee test.log
+      - name: Test libdispatch (reproducer stock vs patched, SwiftPM smoke)
+        if: env.LIBDISPATCH_REF != ''
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0001-libdispatch-epollhup/run.sh /w/out | tee test-libdispatch.log
+      - uses: actions/checkout@v4
+        if: env.FOUNDATION_REF != ''
+        with:
+          repository: ${{ env.FOUNDATION_REPO }}
+          ref: ${{ env.FOUNDATION_REF }}
+          path: src/foundation
+      - name: Fetch Foundation dependencies at the release-pinned revisions
+        if: env.FOUNDATION_REF != ''
+        run: |
+          set -euo pipefail
+          mkdir -p src/deps
+          git clone -q --depth 1 -b "$SWIFT_FOUNDATION_TAG"     https://github.com/swiftlang/swift-foundation.git     src/deps/swift-foundation
+          git clone -q --depth 1 -b "$SWIFT_FOUNDATION_ICU_TAG" https://github.com/swiftlang/swift-foundation-icu.git src/deps/swift-foundation-icu
+          git clone -q --depth 1 -b "$SWIFT_COLLECTIONS_TAG"    https://github.com/apple/swift-collections.git        src/deps/swift-collections
+      - name: Build Foundation overlay
+        if: env.FOUNDATION_REF != ''
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/foundation/build.sh /w/src/foundation /w/src/deps /w/out 2>&1 | tee build-foundation.log | grep -vE 'warning|^ *[0-9]+ \||^ *[|`]|^$' | tail -60
+      - name: Test Foundation (Process under many open descriptors, stock vs patched, valgrind)
+        if: env.FOUNDATION_REF != ''
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0002-foundation-process/run.sh /w/out | tee test-foundation.log
       - name: Summary
         if: always()
         run: |
-          { echo "### ${{ matrix.arch }}"; echo '```'; cat out/MANIFEST-libdispatch.txt 2>/dev/null; grep -E '^(stock|patched|swift build|SUMMARY)' test.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### ${{ matrix.arch }}"; echo '```'; cat out/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-*.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: overlay-${{ matrix.arch }}
@@ -233,7 +257,7 @@ jobs:
           - \`swift-${RELEASE_ID}-overlay-*.tar.gz\`: only the patched files; extract over an existing ${SWIFT_VERSION} install root (\`tar xzf ... -C /\` for /usr installs).
 
           Statically linked binaries (\`--static-swift-stdlib\`) must be rebuilt to pick up fixes in static libraries.
-          Source: ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}
+          Source: ${LIBDISPATCH_REPO:+libdispatch ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}} ${FOUNDATION_REPO:+foundation ${FOUNDATION_REPO}@${FOUNDATION_REF}}
           EOF
           gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS \
             -R "${{ github.repository }}" --target "${{ github.sha }}" \
