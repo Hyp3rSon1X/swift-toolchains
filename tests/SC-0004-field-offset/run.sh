@@ -37,8 +37,10 @@ done
 
 # The patched frontend must accept the official stdlib / Foundation / Dispatch interfaces and macros:
 # SwiftPM package (Foundation, Dispatch, concurrency, a macro-free test-style target), release build, run.
-rm -rf /tmp/smoke; mkdir -p /tmp/smoke && cd /tmp/smoke && swift package init --type executable --name Smoke >/dev/null
-cat > Sources/main.swift <<'S'
+rm -rf /tmp/smoke; mkdir -p /tmp/smoke/Sources && cd /tmp/smoke
+printf '// swift-tools-version:5.10\nimport PackageDescription\nlet package = Package(name: "Smoke", targets: [.executableTarget(name: "Smoke", path: "Sources")])\n' > Package.swift
+src=Sources/main.swift
+cat > "$src" <<'S'
 import Foundation
 import Dispatch
 struct Item: Codable, Hashable { var id = UUID(); var name: String }

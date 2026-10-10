@@ -97,12 +97,12 @@ case "$STAGE" in
       echo "component: swift-frontend (compiler overlay, SC-0004)"
       echo "swift: $(git -c safe.directory='*' -C "$WS/swift" rev-parse HEAD)"
       for d in llvm-project cmark swift-syntax swift-experimental-string-processing; do
-        echo "$d: $(git -c safe.directory='*' -C "$WS/$d" rev-parse HEAD) ($(git -c safe.directory='*' -C "$WS/$d" describe --tags --exact-match 2>/dev/null || echo untagged))"
+        echo "$d: $(git -c safe.directory='*' -C "$WS/$d" rev-parse HEAD) ($(git -c safe.directory='*' -C "$WS/$d" describe --tags --match 'swift-*-RELEASE' --exact-match 2>/dev/null || echo untagged))"
       done
       echo "arch: $ARCH"
       echo "host compiler: $(clang --version | head -1); $(swiftc --version 2>&1 | head -1)"
       echo "version stock:   $($stock -version 2>&1 | head -1)"
-      echo "version patched: $("$OUT/usr/bin/swift-frontend" -version 2>&1 | head -1)"
+      echo "version patched: $(LD_LIBRARY_PATH=/usr/lib/swift/linux:/usr/lib/swift/host/compiler "$OUT/usr/bin/swift-frontend" -version 2>&1 | head -1)"
       echo "size stock/patched: $(stat -c %s $stock) / $(stat -c %s "$OUT/usr/bin/swift-frontend")"
       echo "NEEDED stock==patched: $(diff <(readelf -d $stock | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort) <(readelf -d "$OUT/usr/bin/swift-frontend" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort) >/dev/null && echo yes || echo NO)"
       (cd "$OUT" && sha256sum usr/bin/swift-frontend)

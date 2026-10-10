@@ -262,24 +262,40 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      # The LLVM/Clang stage depends only on the upstream tag and the build script, not on the swift fix, so its
+      # packed output (~0.1 GB per arch) is cached under <component>-<tag>-<arch>-<hash> (docs: RETENTION).
+      - id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: llvm-stage.tar.zst
+          key: compiler-llvm-${{ env.SWIFT_UPSTREAM_TAG }}-${{ matrix.arch }}-${{ hashFiles('overlays/swift-frontend/build.sh') }}
       - name: Free disk
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
           df -h / | tail -1
       - name: Fetch sources
+        if: steps.cache.outputs.cache-hit != 'true'
         run: overlays/swift-frontend/fetch.sh "$PWD/ws" "$SWIFT_REPO" "$SWIFT_REF" "$SWIFT_UPSTREAM_TAG"
       - name: Build LLVM and Clang libraries
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           start=$(date +%s)
           docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash overlays/swift-frontend/build.sh llvm /w/ws /w/build /w/out 2>&1 | tee build-llvm.log | grep -E '^\[[0-9]+/[0-9]+\]|^llvm stage|error' | awk 'NR%200==1 || /error/' | tail -150
           echo "llvm stage seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
           df -h / | tail -1
       - name: Pack the LLVM build tree (no object files)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           sudo chown -R "$USER" build
           tar -C build -cf - --exclude='*.o' --exclude='*.o.d' --exclude='.ninja_*' llvm cmark | zstd -T0 -3 -o llvm-stage.tar.zst
           ls -la llvm-stage.tar.zst | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/cache/save@v6
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: llvm-stage.tar.zst
+          key: compiler-llvm-${{ env.SWIFT_UPSTREAM_TAG }}-${{ matrix.arch }}-${{ hashFiles('overlays/swift-frontend/build.sh') }}
       - uses: actions/upload-artifact@v7
         with:
           name: compiler-llvm-${{ matrix.arch }}
