@@ -367,10 +367,12 @@ jobs:
           path: compiler
       - name: Test the swapped frontend (reproducers stock vs patched, SwiftPM smoke)
         run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0004-field-offset/run.sh /w/compiler | tee test-compiler.log
+      - name: Test the swapped frontend (SC-0006 / SC-0019 #isolation in nonisolated(nonsending) code)
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0006-isolation-macro/run.sh /w/compiler | tee test-isolation.log
       - name: Summary
         if: always()
         run: |
-          { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log test-isolation.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   package:
     needs: [meta, build, compiler-test]
