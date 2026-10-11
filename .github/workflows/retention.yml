@@ -28,7 +28,7 @@ env:
   KEEP_RELEASES_PER_LINE: 3      # per upstream base, e.g. swift-6.4.0-hyp3r.*
   KEEP_PRERELEASES_DAYS: 14      # nightly/test pre-releases
   CACHE_MAX_AGE_DAYS: 5          # GitHub evicts at 7 days unused; we go earlier
-  KEEP_IMAGE_VERSIONS: 6         # per GHCR package, tagged
+  KEEP_IMAGE_VERSIONS: 10        # per GHCR package, tagged (full + slim per release, so 5 releases)
   RUNS_MAX_AGE_DAYS: 30          # workflow runs (logs) older than this are deleted
 
 defaults:
