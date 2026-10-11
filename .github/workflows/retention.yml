@@ -55,18 +55,20 @@ jobs:
       - name: Old pre-releases, and releases beyond KEEP_RELEASES_PER_LINE per line
         run: |
           cutoff=$(date -u -d "-${KEEP_PRERELEASES_DAYS} days" +%s)
+          # 5th column: platform. macOS-only releases (every asset named *-macos-*) and Linux releases are separate
+          # lines, so a run of macOS respins never prunes the newest Linux release (and vice versa).
           gh api --paginate "repos/$REPO/releases?per_page=100" \
-            -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)"' > releases.tsv
+            -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)\t\(if (.assets | length) > 0 and all(.assets[]; .name | test("-macos-")) then "macos" else "linux" end)"' > releases.tsv
           # pre-releases by age
-          while IFS=$'\t' read -r id tag pre created; do
+          while IFS=$'\t' read -r id tag pre created platform; do
             if [ "$pre" = true ] && [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ]; then
               echo "pre-release $tag ($created)"
               [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
             fi
           done < releases.tsv
-          # full releases: keep newest N per line (tag minus the trailing .<n>)
+          # full releases: keep newest N per line (tag minus the trailing .<n>, per platform)
           awk -F'\t' '$3=="false"' releases.tsv | sort -t$'\t' -k4,4r |
-          awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/\.[0-9]+$/,"",line); if (++seen[line] > keep) print $2}' |
+          awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/\.[0-9]+$/,"",line); line=line "/" $5; if (++seen[line] > keep) print $2}' |
           while read -r tag; do
             echo "release $tag (beyond newest $KEEP_RELEASES_PER_LINE of its line)"
             [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
