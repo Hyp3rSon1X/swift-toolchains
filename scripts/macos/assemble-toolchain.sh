@@ -85,8 +85,8 @@ echo "loads $(wc -l <<<"$loaded" | tr -d ' ') official compiler libraries from u
 # usr/bin/ld shim (see ld-shim.sh). Must resolve to a real linker, not to itself.
 install -m 755 "$LD_SHIM" "$TC/usr/bin/ld"
 real_ld=$(env -u TOOLCHAINS /usr/bin/xcrun --find ld)
-"$TC/usr/bin/ld" -v 2>&1 | head -1
-[ "$(env -i "$TC/usr/bin/ld" -v 2>&1 | head -1)" = "$("$real_ld" -v 2>&1 | head -1)" ] || { echo "error: ld shim does not reach $real_ld" >&2; exit 1; }
+"$TC/usr/bin/ld" -v 2>&1 | sed -n 1p
+[ "$(env -i "$TC/usr/bin/ld" -v 2>&1 | sed -n 1p)" = "$("$real_ld" -v 2>&1 | sed -n 1p)" ] || { echo "error: ld shim does not reach $real_ld" >&2; exit 1; }
 
 # Span back-deployment library with a stamped current_version: same install name and exported symbols as the
 # swift.org copy it replaces, for every architecture of that copy. It may add an arm64e slice (Xcode's copy has
