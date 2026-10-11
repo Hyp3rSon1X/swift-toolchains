@@ -2,15 +2,16 @@
 # Usage: assemble-toolchain.sh <base.xctoolchain> <swift build dir> <out-dir> <release-id> <version> <display-suffix> \
 #          [<libswiftCompatibilitySpan.dylib>]
 #   e.g. assemble-toolchain.sh ~/Library/Developer/Toolchains/swift-6.4.0-RELEASE.xctoolchain \
-#          <build-script build>/swift-macosx-arm64 build/macos-toolchain 6.4.0-hyp3r.5 6.4.20261011105 "SC-0004" \
-#          <build-script build>/swift-span-macosx/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib
+#          <build-script build>/swift-macosx-arm64 build/macos-toolchain 6.4.0-hyp3r.6 6.4.20261011106 "SC-0004" \
+#          <build-script build>/swift-span-macosx/out/libswiftCompatibilitySpan.dylib
 # Produces <out-dir>/swift-<release-id>.xctoolchain: a copy of the official swift.org toolchain with
 #   - usr/bin/swift-frontend replaced. The new frontend runs against the toolchain's official
 #     usr/lib/swift/host/compiler/lib_CompilerSwift*.dylib (same rpaths as the official frontend);
 #   - usr/bin/ld added: ld-shim.sh, which runs the active developer directory's linker (swift.org toolchains
 #     ship no ld, which breaks Xcode's package-manifest linking, see ld-shim.sh);
 #   - optionally usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib replaced by a build from
-#     build-span-shim.sh (same sources and exports, current_version stamped instead of 0.0.0).
+#     build-span-shim.sh (same sources and exports, current_version stamped instead of 0.0.0, plus an arm64e
+#     slice like Xcode's copy).
 #
 # Relink: the frontend's final link is redone (from `ninja -t commands`) against the base toolchain's
 # lib_CompilerSwift*.dylib instead of the ones in the build tree. The code is unchanged; only the binding of
@@ -87,16 +88,22 @@ real_ld=$(env -u TOOLCHAINS /usr/bin/xcrun --find ld)
 "$TC/usr/bin/ld" -v 2>&1 | head -1
 [ "$(env -i "$TC/usr/bin/ld" -v 2>&1 | head -1)" = "$("$real_ld" -v 2>&1 | head -1)" ] || { echo "error: ld shim does not reach $real_ld" >&2; exit 1; }
 
-# Span back-deployment library with a stamped current_version: same install name, architectures and exported
-# symbols as the swift.org copy it replaces.
+# Span back-deployment library with a stamped current_version: same install name and exported symbols as the
+# swift.org copy it replaces, for every architecture of that copy. It may add an arm64e slice (Xcode's copy has
+# x86_64, arm64 and arm64e; swift.org's lacks arm64e); that slice is checked against the official arm64 slice.
 if [ -n "$SPAN" ]; then
   S="$TC/usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib"
   [ -f "$S" ] || { echo "error: base toolchain has no $S" >&2; exit 1; }
-  [ "$(lipo -archs "$SPAN")" = "$(lipo -archs "$S")" ] || { echo "error: architectures differ" >&2; exit 1; }
+  span_archs=" $(lipo -archs "$SPAN") "
   for a in $(lipo -archs "$S"); do
-    [ "$(otool -D -arch "$a" "$SPAN" | tail -1)" = "$(otool -D -arch "$a" "$S" | tail -1)" ] || { echo "error: install name differs ($a)" >&2; exit 1; }
-    cmp -s <(nm -gU -arch "$a" "$SPAN" | awk '{print $3}' | sort) <(nm -gU -arch "$a" "$S" | awk '{print $3}' | sort) \
-      || { echo "error: exported symbols differ ($a)" >&2; exit 1; }
+    case "$span_archs" in *" $a "*) ;; *) echo "error: $SPAN lacks $a" >&2; exit 1 ;; esac
+  done
+  for a in $span_archs; do
+    ref=$a; [ "$a" = arm64e ] && ref=arm64
+    case " $(lipo -archs "$S") " in *" $ref "*) ;; *) echo "error: unexpected architecture $a" >&2; exit 1 ;; esac
+    [ "$(otool -D -arch "$a" "$SPAN" | tail -1)" = "$(otool -D -arch "$ref" "$S" | tail -1)" ] || { echo "error: install name differs ($a)" >&2; exit 1; }
+    cmp -s <(nm -gUj -arch "$a" "$SPAN" | sort) <(nm -gUj -arch "$ref" "$S" | sort) \
+      || { echo "error: exported symbols differ ($a vs official $ref)" >&2; exit 1; }
   done
   cp "$SPAN" "$S"; chmod 755 "$S"
   strip -S "$S"
