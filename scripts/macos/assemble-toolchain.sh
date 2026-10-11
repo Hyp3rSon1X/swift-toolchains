@@ -1,10 +1,16 @@
 #!/bin/bash
-# Usage: assemble-toolchain.sh <base.xctoolchain> <swift build dir> <out-dir> <release-id> <version> <display-suffix>
+# Usage: assemble-toolchain.sh <base.xctoolchain> <swift build dir> <out-dir> <release-id> <version> <display-suffix> \
+#          [<libswiftCompatibilitySpan.dylib>]
 #   e.g. assemble-toolchain.sh ~/Library/Developer/Toolchains/swift-6.4.0-RELEASE.xctoolchain \
-#          <build-script build>/swift-macosx-arm64 build/macos-toolchain 6.4.0-hyp3r.4 6.4.20261010104 "SC-0004"
-# Produces <out-dir>/swift-<release-id>.xctoolchain: a copy of the official swift.org toolchain in which only
-# usr/bin/swift-frontend is replaced. The new frontend runs against the toolchain's official
-# usr/lib/swift/host/compiler/lib_CompilerSwift*.dylib (same rpaths as the official frontend).
+#          <build-script build>/swift-macosx-arm64 build/macos-toolchain 6.4.0-hyp3r.5 6.4.20261011105 "SC-0004" \
+#          <build-script build>/swift-span-macosx/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib
+# Produces <out-dir>/swift-<release-id>.xctoolchain: a copy of the official swift.org toolchain with
+#   - usr/bin/swift-frontend replaced. The new frontend runs against the toolchain's official
+#     usr/lib/swift/host/compiler/lib_CompilerSwift*.dylib (same rpaths as the official frontend);
+#   - usr/bin/ld added: ld-shim.sh, which runs the active developer directory's linker (swift.org toolchains
+#     ship no ld, which breaks Xcode's package-manifest linking, see ld-shim.sh);
+#   - optionally usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib replaced by a build from
+#     build-span-shim.sh (same sources and exports, current_version stamped instead of 0.0.0).
 #
 # Relink: the frontend's final link is redone (from `ninja -t commands`) against the base toolchain's
 # lib_CompilerSwift*.dylib instead of the ones in the build tree. The code is unchanged; only the binding of
@@ -18,9 +24,10 @@
 # TOOLCHAINS=dev.hyp3r.swift.<release-id>; Aliases is emptied, the toolchain never claims "swift". The base
 # toolchain is only read. The bundle seal is redone ad hoc; untouched binaries keep their Developer ID signatures.
 set -euo pipefail
-[ $# -eq 6 ] || { sed -n '2,20p' "$0"; exit 2; }
+[ $# -eq 6 ] || [ $# -eq 7 ] || { sed -n '2,25p' "$0"; exit 2; }
 BASE="$(cd "$1" && pwd)"; BUILD="$(cd "$2" && pwd)"; mkdir -p "$3"; OUT="$(cd "$3" && pwd)"
-RELEASE_ID="$4"; VERSION="$5"; SUFFIX="$6"
+RELEASE_ID="$4"; VERSION="$5"; SUFFIX="$6"; SPAN="${7:-}"
+LD_SHIM="$(cd "$(dirname "$0")" && pwd)/ld-shim.sh"
 SWIFT_VERSION="${RELEASE_ID%%-*}"
 ID="dev.hyp3r.swift.${RELEASE_ID}"
 TC="$OUT/swift-${RELEASE_ID}.xctoolchain"
@@ -29,6 +36,9 @@ HOSTLIB=lib/swift/host/compiler
 [ -f "$BASE/Info.plist" ] && [ -x "$BASE/usr/bin/swift-frontend" ] || { echo "error: $BASE is not a toolchain" >&2; exit 1; }
 [ -x "$BUILD/bin/swift-frontend" ] || { echo "error: no $BUILD/bin/swift-frontend; run ninja swift-frontend" >&2; exit 1; }
 [ ! -e "$TC" ] || { echo "error: $TC exists; remove it first" >&2; exit 1; }
+[ -f "$LD_SHIM" ] || { echo "error: no $LD_SHIM" >&2; exit 1; }
+[ ! -e "$BASE/usr/bin/ld" ] || { echo "error: base toolchain already has usr/bin/ld; review the shim" >&2; exit 1; }
+[ -z "$SPAN" ] || [ -f "$SPAN" ] || { echo "error: no $SPAN" >&2; exit 1; }
 
 # Relink against the official compiler libraries (see above).
 RELINKED="$BUILD/bin/swift-frontend.relinked"
@@ -71,6 +81,30 @@ loaded=$(DYLD_PRINT_LIBRARIES=1 "$F" -version 2>&1 >/dev/null | sed -n 's#.*> \(
 [ -n "$loaded" ] && ! grep -v "^$TC/usr/$HOSTLIB/" <<<"$loaded" || { echo "error: unexpected compiler library load" >&2; exit 1; }
 echo "loads $(wc -l <<<"$loaded" | tr -d ' ') official compiler libraries from usr/$HOSTLIB"
 
+# usr/bin/ld shim (see ld-shim.sh). Must resolve to a real linker, not to itself.
+install -m 755 "$LD_SHIM" "$TC/usr/bin/ld"
+real_ld=$(env -u TOOLCHAINS /usr/bin/xcrun --find ld)
+"$TC/usr/bin/ld" -v 2>&1 | head -1
+[ "$(env -i "$TC/usr/bin/ld" -v 2>&1 | head -1)" = "$("$real_ld" -v 2>&1 | head -1)" ] || { echo "error: ld shim does not reach $real_ld" >&2; exit 1; }
+
+# Span back-deployment library with a stamped current_version: same install name, architectures and exported
+# symbols as the swift.org copy it replaces.
+if [ -n "$SPAN" ]; then
+  S="$TC/usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib"
+  [ -f "$S" ] || { echo "error: base toolchain has no $S" >&2; exit 1; }
+  [ "$(lipo -archs "$SPAN")" = "$(lipo -archs "$S")" ] || { echo "error: architectures differ" >&2; exit 1; }
+  for a in $(lipo -archs "$S"); do
+    [ "$(otool -D -arch "$a" "$SPAN" | tail -1)" = "$(otool -D -arch "$a" "$S" | tail -1)" ] || { echo "error: install name differs ($a)" >&2; exit 1; }
+    cmp -s <(nm -gU -arch "$a" "$SPAN" | awk '{print $3}' | sort) <(nm -gU -arch "$a" "$S" | awk '{print $3}' | sort) \
+      || { echo "error: exported symbols differ ($a)" >&2; exit 1; }
+  done
+  cp "$SPAN" "$S"; chmod 755 "$S"
+  strip -S "$S"
+  codesign -f -s - -i libswiftCompatibilitySpan "$S"
+  codesign --verify --strict "$S"
+  echo "Span shim: $(otool -l -arch arm64 "$S" | awk '/LC_ID_DYLIB/{f=1} f&&/current version/{print "current_version "$3; exit}')"
+fi
+
 P="$TC/Info.plist"
 plutil -replace CFBundleIdentifier -string "$ID" "$P"
 plutil -replace DisplayName -string "Swift ${SWIFT_VERSION} ${RELEASE_ID#*-} (${SUFFIX})" "$P"
@@ -86,5 +120,5 @@ codesign --verify --strict "$TC"
 
 plutil -p "$P"
 "$F" -print-target-info | grep -E '"(compilerVersion|swiftCompilerTag)"'
-shasum -a 256 "$F"
+shasum -a 256 "$F" "$TC/usr/bin/ld" ${SPAN:+"$TC/usr/lib/swift-6.2/macosx/libswiftCompatibilitySpan.dylib"}
 echo "assembled $TC"
