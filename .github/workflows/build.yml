@@ -82,6 +82,9 @@ jobs:
       - name: Test libdispatch (reproducer stock vs patched, SwiftPM smoke)
         if: env.LIBDISPATCH_REF != ''
         run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0001-libdispatch-epollhup/run.sh /w/out | tee test-libdispatch.log
+      - name: Test libdispatch (SC-0014 signal source after SIG_IGN)
+        if: env.LIBDISPATCH_REF != ''
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0014-libdispatch-signal-ign/run.sh /w/out | tee test-libdispatch-signal.log
       - uses: actions/checkout@v7
         if: env.FOUNDATION_REF != ''
         with:
