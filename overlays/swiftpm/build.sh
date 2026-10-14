@@ -1,6 +1,6 @@
 #!/bin/bash
-# Builds and installs SwiftPM the way the official Swift 6.4.0 Linux toolchain does, inside the official
-# swift:6.4.0-noble image, then compares the result with the image's own SwiftPM.
+# Builds and installs SwiftPM the way the official Swift Linux toolchain does, inside the official
+# swift:<SWIFT_VERSION>-noble image, then compares the result with the image's own SwiftPM.
 # Build recipe from SwixForge's swix/6.4.0 branch of the SwiftPM fork.
 #
 # Usage: build.sh <out dir>        (after workspace.sh)
@@ -12,14 +12,14 @@
 # swift-sdk, ... are symlinks to it, and the fix (SPMBuildCore) is linked statically into it. lib/swift/pm/ManifestAPI
 # and PluginAPI are untouched by it. usr/bin/sourcekit-lsp links the same modules statically and is not rebuilt.
 #
-# Parity source: swiftlang/swift at swift-6.4.0-RELEASE.
+# Parity source: swiftlang/swift at swift-<SWIFT_VERSION>-RELEASE.
 # - utils/build-presets.ini [preset: buildbot_linux]: `release`, `swiftpm`, `install-swiftpm`, install-prefix=/usr.
 # - utils/swift_build_support/swift_build_support/products/swiftpm.py: build-script runs
 #   `Utilities/bootstrap build --release ...` and then `Utilities/bootstrap install --release ... --prefix <destdir>/usr`;
 #   the installed swift-package comes from the install run, which builds with SWIFTCI_USE_LOCAL_DEPS=1,
 #   SWIFTCI_INSTALL_RPATH_OS=linux and --disable-local-rpath (Utilities/bootstrap get_swiftpm_env_cmd/get_swiftpm_flags).
 # - Difference: build-script first builds a CMake bootstrap SwiftPM (swift-bootstrap) and drives the final build with it;
-#   we pass --skip-cmake-bootstrap, so the image's own 6.4.0 swift-build (same SwiftPM release, same Swift Build
+#   we pass --skip-cmake-bootstrap, so the image's own swift-build (same SwiftPM release, same Swift Build
 #   backend) drives it.
 set -euo pipefail
 out=$(realpath -m "$1")

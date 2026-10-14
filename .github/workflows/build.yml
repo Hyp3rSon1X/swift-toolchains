@@ -422,7 +422,7 @@ jobs:
       - name: Build SwiftPM (parity checks included)
         run: |
           start=$(date +%s)
-          docker run --rm -v "$PWD:/w" -w /w -e SWIFTPM_REF "$BASE_IMAGE" bash -c 'bash overlays/swiftpm/workspace.sh /w/src/swiftpm && bash overlays/swiftpm/build.sh /w/out' 2>&1 | tee build-swiftpm.log | grep -E '^\[[0-9]+/[0-9]+\]|error|^(same|DIFFER|not in|component|source|arch|replaces|parity|[0-9a-f]{64})|ELF|^[a-z-]+ [a-z0-9]+ [0-9a-f]{40}$' | awk 'NR%100==1 || !/^\[/' | tail -80
+          docker run --rm -v "$PWD:/w" -w /w -e SWIFTPM_REF -e SWIFT_VERSION "$BASE_IMAGE" bash -c 'bash overlays/swiftpm/workspace.sh /w/src/swiftpm && bash overlays/swiftpm/build.sh /w/out' 2>&1 | tee build-swiftpm.log | grep -E '^\[[0-9]+/[0-9]+\]|error|^(same|DIFFER|not in|component|source|arch|replaces|parity|[0-9a-f]{64})|ELF|^[a-z-]+ [a-z0-9]+ [0-9a-f]{40}$' | awk 'NR%100==1 || !/^\[/' | tail -80
           echo "swiftpm seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
           test -x out/usr/bin/swift-package
       - name: Summary
