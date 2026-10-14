@@ -385,10 +385,12 @@ jobs:
         run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0003-coercion-lifetime/run.sh /w/compiler | tee test-coercion-lifetime.log
       - name: Test the swapped frontend (SC-0022 typed-throws closure at an opaque abstraction pattern)
         run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0022-typed-throws-closure-opaque/run.sh /w/compiler | tee test-typed-throws-opaque.log
+      - name: Test the swapped frontend (SC-0023 #isolation argument in nonisolated(nonsending) code is not an isolation crossing)
+        run: docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0023-isolation-region/run.sh /w/compiler | tee test-isolation-region.log
       - name: Summary
         if: always()
         run: |
-          { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log test-isolation.log test-typed-throws.log test-coercion-lifetime.log test-typed-throws-opaque.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log test-isolation.log test-typed-throws.log test-coercion-lifetime.log test-typed-throws-opaque.log test-isolation-region.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   # SwiftPM overlay (SC-0024): usr/bin/swift-package rebuilt from the patched SwiftPM fork the way the official Linux
   # toolchain builds it (recipe from SwixForge's swix/6.4.0 branch), compared with the image's own SwiftPM (NEEDED/RUNPATH,
