@@ -1,0 +1,18 @@
+# Build recipe from SwixForge's swix/6.4.0 branch of the SwiftPM fork.
+# Dependencies of SwiftPM 6.4.0 as the official toolchain built them: swiftlang/swift at
+# swift-6.4.0-RELEASE, utils/update_checkout/update-checkout-config.json, scheme release/6.4.0
+# (swiftlang repositories at their swift-6.4.0-RELEASE tags, the others at the pinned versions).
+# Columns: checkout directory (sibling of swiftpm), repository, tag, commit.
+llbuild https://github.com/swiftlang/swift-llbuild.git swift-6.4.0-RELEASE ab6421207b9e4971c94e97c5832a3d8a4cae9092
+swift-build https://github.com/swiftlang/swift-build.git swift-6.4.0-RELEASE 807b9cd2dc7a447cafe9a6612df47f95313f2877
+swift-tools-support-core https://github.com/swiftlang/swift-tools-support-core.git swift-6.4.0-RELEASE d45c8b38d2824498b7863d3d5f0227937a53c177
+swift-driver https://github.com/swiftlang/swift-driver.git swift-6.4.0-RELEASE 174567a5681a9a949bcd52f821deb8fa65105434
+swift-syntax https://github.com/swiftlang/swift-syntax.git swift-6.4.0-RELEASE 050f1a346fbbac0ca2cfb15a95274f7bd1cf0ccf
+swift-tools-protocols https://github.com/swiftlang/swift-tools-protocols.git swift-6.4.0-RELEASE 4345e69c5572ec3d1f737fba90bca024b32da5cf
+swift-argument-parser https://github.com/apple/swift-argument-parser.git 1.6.1 309a47b2b1d9b5e991f36961c983ecec72275be3
+swift-crypto https://github.com/apple/swift-crypto.git 3.12.5 d79c573e1b400d670ed12c0cb29d33f2c0f5ab70
+swift-system https://github.com/apple/swift-system.git 1.5.0 61e4ca4b81b9e09e2ec863b00c340eb13497dac6
+swift-collections https://github.com/apple/swift-collections.git 1.1.6 c11818f3cae0780656baa430b49e7f163f08dffd
+swift-certificates https://github.com/apple/swift-certificates.git 1.10.1 386001a92200c70fd06217b3ccad58d7226edb84
+swift-asn1 https://github.com/apple/swift-asn1.git 1.3.2 a54383ada6cecde007d374f58f864e29370ba5c3
+swift-toolchain-sqlite https://github.com/swiftlang/swift-toolchain-sqlite.git 1.0.9 c0ecc1e0fd1b4fbc38db1efa6113bc12c2a4e559

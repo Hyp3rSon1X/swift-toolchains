@@ -13,6 +13,10 @@ on:
         description: "Push images and create the GitHub release"
         type: boolean
         default: false
+      dry_run:
+        description: "Assemble tarballs and build (not push) the images, without publishing; for branch test runs"
+        type: boolean
+        default: false
   push:
     branches: [main]
     paths: ["releases/**", "overlays/**", "tests/**", "docker/**", ".github/workflows/build.yml"]
@@ -41,6 +45,7 @@ jobs:
       id: ${{ steps.r.outputs.id }}
       static: ${{ steps.r.outputs.static }}
       compiler: ${{ steps.r.outputs.compiler }}
+      swiftpm: ${{ steps.r.outputs.swiftpm }}
     steps:
       - uses: actions/checkout@v7
       - id: r
@@ -53,6 +58,8 @@ jobs:
           echo "static=$(sed -n 's/^STATIC_SDK_VERSION=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
           # Non-empty when the release ships a rebuilt swift-frontend (jobs compiler-*).
           echo "compiler=$(sed -n 's/^SWIFT_REF=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
+          # Non-empty when the release ships a rebuilt usr/bin/swift-package (jobs swiftpm, swiftpm-test).
+          echo "swiftpm=$(sed -n 's/^SWIFTPM_REF=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
           cat "releases/$id.env"
 
   build:
@@ -383,10 +390,85 @@ jobs:
         run: |
           { echo "### compiler ${{ matrix.arch }}"; echo '```'; cat compiler/MANIFEST-*.txt 2>/dev/null; grep -hE '^(stock|patched|swift build|SUMMARY)' test-compiler.log test-isolation.log test-typed-throws.log test-coercion-lifetime.log test-typed-throws-opaque.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
+  # SwiftPM overlay (SC-0024): usr/bin/swift-package rebuilt from the patched SwiftPM fork the way the official Linux
+  # toolchain builds it (recipe from SwixForge's swix/6.4.0 branch), compared with the image's own SwiftPM (NEEDED/RUNPATH,
+  # --version, installed file set). swiftpm-test then proves the plugin pipe spin is gone.
+  swiftpm:
+    needs: meta
+    if: needs.meta.outputs.swiftpm != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SWIFTPM_REPO }}
+          ref: ${{ env.SWIFTPM_REF }}
+          path: src/swiftpm
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
+          df -h / | tail -1
+      - name: Build SwiftPM (parity checks included)
+        run: |
+          start=$(date +%s)
+          docker run --rm -v "$PWD:/w" -w /w -e SWIFTPM_REF "$BASE_IMAGE" bash -c 'bash overlays/swiftpm/workspace.sh /w/src/swiftpm && bash overlays/swiftpm/build.sh /w/out' 2>&1 | tee build-swiftpm.log | grep -E '^\[[0-9]+/[0-9]+\]|error|^(same|DIFFER|not in|component|source|arch|replaces|parity|[0-9a-f]{64})|ELF|^[a-z-]+ [a-z0-9]+ [0-9a-f]{40}$' | awk 'NR%100==1 || !/^\[/' | tail -80
+          echo "swiftpm seconds: $(( $(date +%s) - start ))" | tee -a "$GITHUB_STEP_SUMMARY"
+          test -x out/usr/bin/swift-package
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### swiftpm ${{ matrix.arch }}"; echo '```'; cat out/MANIFEST-swiftpm.txt out/parity.txt 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: swiftpm-${{ matrix.arch }}
+          path: out/
+          retention-days: 3
+          compression-level: 6
+
+  swiftpm-test:
+    needs: [meta, build, swiftpm]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Load manifest
+        run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+      - uses: actions/download-artifact@v8
+        with:
+          name: overlay-${{ matrix.arch }}
+          path: overlay
+      - uses: actions/download-artifact@v8
+        with:
+          name: swiftpm-${{ matrix.arch }}
+          path: swiftpm
+      - name: Test (SC-0024 plugin output pipes at end-of-file, stock vs patched swift-package; patched libdispatch)
+        run: |
+          chmod 0755 swiftpm/usr/bin/swift-package
+          docker run --rm --cap-add SYS_PTRACE -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0024-swiftpm-plugin-pipe-eof/run.sh /w/overlay /w/swiftpm/usr/bin/swift-package | tee test-swiftpm.log
+      - name: Summary
+        if: always()
+        run: |
+          { echo "### swiftpm ${{ matrix.arch }}"; echo '```'; grep -hE '^(stock|patched|SUMMARY)' test-swiftpm.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
   package:
-    needs: [meta, build, compiler-test]
+    needs: [meta, build, compiler-test, swiftpm-test]
     # compiler-test is skipped for releases without SWIFT_REF; a skipped need must not skip the package.
-    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish }}
+    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.publish || inputs.dry_run) }}
     strategy:
       fail-fast: false
       matrix:
@@ -407,6 +489,11 @@ jobs:
         if: needs.meta.outputs.compiler != ''
         with:
           name: compiler-${{ matrix.arch }}
+          path: overlay
+      - uses: actions/download-artifact@v8
+        if: needs.meta.outputs.swiftpm != ''
+        with:
+          name: swiftpm-${{ matrix.arch }}
           path: overlay
       # actions/upload-artifact does not keep file modes: without this the overlay ships a 0644 swift-frontend
       # (hyp3r.7 did; the driver then spins on EACCES and `swift --version` never returns).
@@ -432,6 +519,7 @@ jobs:
           # Gate: the assembled toolchain's frontend and driver must run.
           timeout 60 "$base/usr/bin/swift-frontend" -frontend -version
           timeout 60 "$base/usr/bin/swift-driver" --driver-mode=swiftc --version
+          timeout 60 "$base/usr/bin/swift-package" --version
           name="swift-${RELEASE_ID}-${{ matrix.suffix }}"
           mv "$base" "$name"
           cp overlay/MANIFEST-*.txt "$name/"
@@ -447,8 +535,8 @@ jobs:
           compression-level: 0
 
   image:
-    needs: [meta, build, compiler-test]
-    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: [meta, build, compiler-test, swiftpm-test]
+    if: ${{ !failure() && !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.publish || inputs.dry_run) }}
     permissions:
       contents: read
       packages: write
@@ -473,6 +561,11 @@ jobs:
         with:
           name: compiler-${{ matrix.arch }}
           path: overlay
+      - uses: actions/download-artifact@v8
+        if: needs.meta.outputs.swiftpm != ''
+        with:
+          name: swiftpm-${{ matrix.arch }}
+          path: overlay
       # actions/upload-artifact does not keep file modes: without this the overlay ships a 0644 swift-frontend
       # (hyp3r.7 did; the driver then spins on EACCES and `swift --version` never returns).
       - name: Restore executable bits
@@ -482,11 +575,23 @@ jobs:
           find overlay/usr/bin -type f ! -perm -0111 2>/dev/null | { ! grep .; }
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
+        if: inputs.publish
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # Dry run (branch tests): build both images into the local daemon and run the same gates; nothing is pushed.
+      - name: Build locally and smoke-test (dry run, no push)
+        if: ${{ inputs.dry_run && !inputs.publish }}
+        run: |
+          set -euo pipefail
+          docker buildx build --platform ${{ matrix.platform }} -f docker/Dockerfile       --build-arg BASE="$BASE_IMAGE"      --load -t dry-full .
+          docker buildx build --platform ${{ matrix.platform }} -f docker/Dockerfile.slim  --build-arg BASE="$BASE_IMAGE_SLIM" --load -t dry-slim .
+          docker run --rm dry-full bash -c \
+            'set -e; timeout 60 swift --version; if [ -n "'"$SWIFTPM_REF"'" ]; then timeout 60 swift package --version; fi; echo "print(\"hello \\(6 * 7)\")" > /tmp/h.swift; timeout 600 swiftc -O /tmp/h.swift -o /tmp/h; /tmp/h | grep -qx "hello 42"; echo image smoke ok'
+          docker run --rm dry-slim bash -c 'ls /usr/lib/swift/linux/libdispatch.so >/dev/null && echo slim smoke ok'
       - name: Build and push by digest
+        if: inputs.publish
         run: |
           set -euo pipefail
           mkdir -p digests
@@ -503,10 +608,11 @@ jobs:
           done
           # Gate: the pushed (still untagged) full image must run the driver and build and run a program.
           docker run --rm "${IMAGE}@$(cat digests/full-${{ matrix.arch }})" bash -c \
-            'set -e; timeout 60 swift --version; echo "print(\"hello \\(6 * 7)\")" > /tmp/h.swift; timeout 600 swiftc -O /tmp/h.swift -o /tmp/h; /tmp/h | grep -qx "hello 42"; echo image smoke ok'
+            'set -e; timeout 60 swift --version; if [ -n "'"$SWIFTPM_REF"'" ]; then timeout 60 swift package --version; fi; echo "print(\"hello \\(6 * 7)\")" > /tmp/h.swift; timeout 600 swiftc -O /tmp/h.swift -o /tmp/h; /tmp/h | grep -qx "hello 42"; echo image smoke ok'
           docker run --rm "${IMAGE}@$(cat digests/slim-${{ matrix.arch }})" bash -c 'ls /usr/lib/swift/linux/libdispatch.so >/dev/null && echo slim smoke ok'
           cat digests/*
       - uses: actions/upload-artifact@v7
+        if: inputs.publish
         with:
           name: digests-${{ matrix.arch }}
           path: digests/
@@ -584,11 +690,11 @@ jobs:
 
           **Tarballs**
           - \`swift-${RELEASE_ID}-ubuntu24.04[-aarch64].tar.gz\`: full official toolchain (signature-verified) with the patched libraries.
-          - \`swift-${RELEASE_ID}-overlay-*.tar.gz\`: only the patched files; extract over an existing ${SWIFT_VERSION} install root (\`tar xzf ... -C /\` for /usr installs).
+          - \`swift-${RELEASE_ID}-overlay-*.tar.gz\`: only the patched files (SwiftPM: usr/bin/swift-package only; swift-build, swift-test, ... are symlinks to it); extract over an existing ${SWIFT_VERSION} install root (\`tar xzf ... -C /\` for /usr installs).
 
           Statically linked binaries (\`--static-swift-stdlib\`) must be rebuilt to pick up fixes in static libraries.
           ${sdk_note:-}
-          Source: ${LIBDISPATCH_REPO:+libdispatch ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}} ${FOUNDATION_REPO:+foundation ${FOUNDATION_REPO}@${FOUNDATION_REF}}
+          Source: ${LIBDISPATCH_REPO:+libdispatch ${LIBDISPATCH_REPO}@${LIBDISPATCH_REF}} ${FOUNDATION_REPO:+foundation ${FOUNDATION_REPO}@${FOUNDATION_REF}} ${SWIFTPM_REPO:+swiftpm ${SWIFTPM_REPO}@${SWIFTPM_REF}}
           EOF
           gh release create "swift-${RELEASE_ID}" dist/*.tar.gz dist/SHA256SUMS "${sdk_files[@]}" \
             -R "${{ github.repository }}" --target "${{ github.sha }}" \
