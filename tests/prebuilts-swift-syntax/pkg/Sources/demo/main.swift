@@ -1,0 +1,3 @@
+import DemoMacroAPI
+
+print(#answer())

@@ -1,0 +1,9 @@
+# Overlay image with SwiftPM prebuilts: docker/Dockerfile plus the official swift-syntax prebuilts (renamed to this
+# compiler's tag by scripts/swiftpm-prebuilts.sh, checksum verified) for
+# `swift build --experimental-prebuilts-download-url "$HYP3R_SWIFTPM_PREBUILTS_URL"`. Used for the full image only, and only
+# when the release manifest sets SWIFTPM_PREBUILTS; otherwise docker/Dockerfile (byte-identical images to before).
+ARG BASE
+FROM ${BASE}
+COPY overlay/usr/ /usr/
+COPY prebuilts/ /opt/hyp3r/swiftpm-prebuilts/
+ENV HYP3R_SWIFTPM_PREBUILTS_URL=file:///opt/hyp3r/swiftpm-prebuilts
