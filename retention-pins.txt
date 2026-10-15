@@ -1,0 +1,7 @@
+# Release ids that retention must never prune: GitHub release swift-<id>, GHCR tags <id>-noble and <id>-noble-slim,
+# and the same tags in registry.hyp3r.dev. One id per line; trailing comments allowed. A pin is added with owner and
+# date, and removed (in a commit) as soon as the consumer has moved on. Pinned ids do not count against the keep limits
+# (KEEP_RELEASES_PER_LINE, KEEP_IMAGE_VERSIONS, the mirror's newest 3), so a pin never evicts an unpinned release.
+# Format: <id>  # <owner>, <date added>, <reason / until>
+6.4.0-hyp3r.15  # SwixForge main, 2026-10-15: pinned by digest via the mirror, until it moves to 6.4.0-hyp3r.17
+6.4.0-hyp3r.13  # SwixWebSuite Quiver, 2026-10-15: pinned by GHCR digest

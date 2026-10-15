@@ -28,7 +28,7 @@ env:
   KEEP_RELEASES_PER_LINE: 3      # per upstream base, e.g. swift-6.4.0-hyp3r.*
   KEEP_PRERELEASES_DAYS: 14      # nightly/test pre-releases
   CACHE_MAX_AGE_DAYS: 5          # GitHub evicts at 7 days unused; we go earlier
-  KEEP_IMAGE_VERSIONS: 10        # per GHCR package, tagged (full + slim per release, so 5 releases)
+  KEEP_IMAGE_VERSIONS: 10        # per GHCR package, tagged (full + slim per release, so 5 releases); pinned releases come on top
   RUNS_MAX_AGE_DAYS: 30          # workflow runs (logs) older than this are deleted
 
 defaults:
@@ -40,6 +40,23 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@v7
+      # retention-pins.txt: release ids that are never pruned (docs: README, "Retention pins").
+      - name: Pinned releases
+        run: |
+          set -euo pipefail
+          scripts/retention-pins.sh > pins.txt
+          # GitHub release tags and GHCR tag patterns of the pinned ids
+          sed 's/^/swift-/' pins.txt > pin-release-tags.txt
+          # Pinned ids do not count against keep-n-tagged: the action's docs do not say whether excluded tags are
+          # counted, so the keep is raised by the 2 tags (full, slim) per pin; either way the newest unpinned
+          # releases keep their full KEEP_IMAGE_VERSIONS and the pinned tags are never candidates for deletion.
+          pins=$(wc -l < pins.txt | tr -d ' ')
+          excl="latest,*-latest"
+          while read -r id; do excl="$excl,${id}-noble,${id}-noble-slim"; done < pins.txt
+          { echo "GHCR_EXCLUDE=$excl"; echo "GHCR_KEEP=$(( KEEP_IMAGE_VERSIONS + 2 * pins ))"; } >> "$GITHUB_ENV"
+          echo "pinned: $(tr '\n' ' ' < pins.txt); GHCR exclude: $excl; GHCR keep: $(( KEEP_IMAGE_VERSIONS + 2 * pins ))"
+
       - name: Caches older than CACHE_MAX_AGE_DAYS (last access)
         run: |
           cutoff=$(date -u -d "-${CACHE_MAX_AGE_DAYS} days" +%s)
@@ -62,13 +79,15 @@ jobs:
             -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)\t\(if any(.assets[]; .name | test("-macos-")) then "macos" else "linux" end)"' > releases.tsv
           # pre-releases by age
           while IFS=$'\t' read -r id tag pre created platform; do
+            if grep -qxF "$tag" pin-release-tags.txt; then echo "pinned, kept: $tag"; continue; fi
             if [ "$pre" = true ] && [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ]; then
               echo "pre-release $tag ($created)"
               [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
             fi
           done < releases.tsv
           # full releases: keep newest N per line (tag minus the trailing .<n>, per platform)
-          awk -F'\t' '$3=="false"' releases.tsv | sort -t$'\t' -k4,4r |
+          # pinned releases are neither deleted nor counted towards the newest N of their line
+          awk -F'\t' '$3=="false"' releases.tsv | { grep -vF -f <(awk '{ print "\t" $0 "\t" }' pin-release-tags.txt) || true; } | sort -t$'\t' -k4,4r |
           awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/\.[0-9]+$/,"",line); line=line "/" $5; if (++seen[line] > keep) print $2}' |
           while read -r tag; do
             echo "release $tag (beyond newest $KEEP_RELEASES_PER_LINE of its line)"
@@ -91,8 +110,8 @@ jobs:
         with:
           token: ${{ github.token }}
           package: swift
-          keep-n-tagged: ${{ env.KEEP_IMAGE_VERSIONS }}
-          exclude-tags: "latest,*-latest"
+          keep-n-tagged: ${{ env.GHCR_KEEP }}
+          exclude-tags: "${{ env.GHCR_EXCLUDE }}"
           delete-untagged: true
           delete-partial-images: true
           dry-run: ${{ env.DRY }}

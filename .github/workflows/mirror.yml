@@ -60,15 +60,19 @@ jobs:
             done
           done | tee mirrored.txt
           { echo "### Mirrored"; echo '```'; cat mirrored.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Pinned releases (retention-pins.txt) are neither pruned nor counted among the newest KEEP_RELEASES: they are
+      # removed from the candidate list, and a tag that is not a candidate is protected like a moving tag below.
       - name: Prune to the newest KEEP_RELEASES releases
         run: |
           set -euo pipefail
+          scripts/retention-pins.sh > pins.txt
+          echo "pinned: $(tr '\n' ' ' < pins.txt)"
           auth="$(cat "$RUNNER_TEMP/reg-auth")"
           accept='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
           digest() { curl -fsS -I -u "$auth" -H "Accept: $accept" "https://${REG}/v2/${NS}/$1/manifests/$2" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p'; }
           for repo in swift swift-slim; do
             tags=$(curl -fsS -u "$auth" "https://${REG}/v2/${NS}/${repo}/tags/list" | jq -r '.tags[]?')
-            ids=$(printf '%s\n' "$tags" | sed -n 's/^\(.*-hyp3r\.[0-9][0-9]*\)-noble$/\1/p' | sort -V)
+            ids=$(printf '%s\n' "$tags" | sed -n 's/^\(.*-hyp3r\.[0-9][0-9]*\)-noble$/\1/p' | { grep -vxF -f pins.txt || true; } | sort -V)
             keep=$(printf '%s\n' "$ids" | tail -n "$KEEP_RELEASES")
             old=$(printf '%s\n' "$ids" | head -n -"$KEEP_RELEASES" || true)
             # digests that must survive: kept releases + every non-release (moving) tag
