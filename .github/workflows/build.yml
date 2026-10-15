@@ -46,6 +46,10 @@ jobs:
       static: ${{ steps.r.outputs.static }}
       compiler: ${{ steps.r.outputs.compiler }}
       swiftpm: ${{ steps.r.outputs.swiftpm }}
+      # Base images pinned to their multi-arch index digests once per run (swift:<tag>@sha256:<digest>), so every job of
+      # the run, the image labels and the release notes use the same base even if Docker Hub moves the tag meanwhile.
+      base: ${{ steps.base.outputs.base }}
+      base_slim: ${{ steps.base.outputs.base_slim }}
     steps:
       - uses: actions/checkout@v7
       - id: r
@@ -61,6 +65,25 @@ jobs:
           # Non-empty when the release ships a rebuilt usr/bin/swift-package (jobs swiftpm, swiftpm-test).
           echo "swiftpm=$(sed -n 's/^SWIFTPM_REF=//p' "releases/$id.env")" >> "$GITHUB_OUTPUT"
           cat "releases/$id.env"
+      - uses: docker/setup-buildx-action@v4
+      - id: base
+        run: |
+          set -euo pipefail
+          id="${{ steps.r.outputs.id }}"
+          # shellcheck disable=SC1090
+          . "releases/$id.env"
+          resolve() {
+            case "$1" in
+              *@sha256:*) echo "$1" ;;   # the manifest already pins a digest: use as is
+              *) d=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1")
+                 case "$d" in sha256:*) ;; *) echo "::error::no index digest for $1: $d" >&2; exit 1 ;; esac
+                 echo "$1@$d" ;;
+            esac
+          }
+          base=$(resolve "$BASE_IMAGE"); base_slim=$(resolve "$BASE_IMAGE_SLIM")
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "base_slim=$base_slim" >> "$GITHUB_OUTPUT"
+          { echo "### Base images"; echo '```'; echo "$base"; echo "$base_slim"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: meta
@@ -76,6 +99,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       # An overlay is built and tested only when the manifest sets its *_REF (hyp3r.1 has no foundation).
       - uses: actions/checkout@v7
         if: env.LIBDISPATCH_REF != ''
@@ -140,6 +166,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.LIBDISPATCH_REPO }}
@@ -192,6 +221,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           pattern: static-sdk-built-*
@@ -236,6 +268,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           name: static-sdk-bundle
@@ -272,6 +307,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       # The LLVM/Clang stage depends only on the upstream tag and the build script, not on the swift fix, so its
       # packed output (~0.1 GB per arch) is cached under <component>-<tag>-<arch>-<hash> (docs: RETENTION).
       - id: cache
@@ -327,6 +365,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - name: Free disk
         run: |
           sudo rm -rf /usr/local/lib/android /opt/hostedtoolcache /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost /usr/share/swift
@@ -371,6 +412,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           name: compiler-${{ matrix.arch }}
@@ -410,6 +454,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/checkout@v7
         with:
           repository: ${{ env.SWIFTPM_REPO }}
@@ -450,6 +497,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           name: overlay-${{ matrix.arch }}
@@ -483,6 +533,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           name: overlay-${{ matrix.arch }}
@@ -554,6 +607,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           name: overlay-${{ matrix.arch }}
@@ -582,23 +638,44 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # SwiftPM swift-syntax prebuilts (manifest: SWIFTPM_PREBUILTS=swift-syntax:<ver>, SWIFTPM_PREBUILTS_SOURCE_TAG): a probe
+      # build of the plain full image tells which compiler tag SwiftPM will look for; the official swift.org files are fetched
+      # (sha256 of the archive checked against the signed manifest), stored under that name and baked into the full image
+      # by docker/Dockerfile.prebuilts. Releases without the variable are built exactly as before.
+      - name: SwiftPM prebuilts (name from the built compiler, official files, checksum)
+        if: env.SWIFTPM_PREBUILTS != ''
+        run: |
+          set -euo pipefail
+          docker buildx build --platform ${{ matrix.platform }} -f docker/Dockerfile --build-arg BASE="$BASE_IMAGE" --load -t probe-full .
+          mkdir -p digests
+          scripts/swiftpm-prebuilts.sh probe-full ${{ matrix.arch }} "$SWIFTPM_PREBUILTS" "$SWIFTPM_PREBUILTS_SOURCE_TAG" prebuilts | tee digests/prebuilts-${{ matrix.arch }}.txt
+          find prebuilts -type f | sort
+          echo "DOCKERFILE_FULL=docker/Dockerfile.prebuilts" >> "$GITHUB_ENV"
+          { echo "### SwiftPM prebuilts ${{ matrix.arch }}"; echo '```'; cat digests/prebuilts-${{ matrix.arch }}.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Dry run (branch tests): build both images into the local daemon and run the same gates; nothing is pushed.
       - name: Build locally and smoke-test (dry run, no push)
         if: ${{ inputs.dry_run && !inputs.publish }}
         run: |
           set -euo pipefail
-          docker buildx build --platform ${{ matrix.platform }} -f docker/Dockerfile       --build-arg BASE="$BASE_IMAGE"      --load -t dry-full .
+          docker buildx build --platform ${{ matrix.platform }} -f "${DOCKERFILE_FULL:-docker/Dockerfile}" --build-arg BASE="$BASE_IMAGE" --load -t dry-full .
           docker buildx build --platform ${{ matrix.platform }} -f docker/Dockerfile.slim  --build-arg BASE="$BASE_IMAGE_SLIM" --load -t dry-slim .
           docker run --rm dry-full bash -c \
             'set -e; timeout 60 swift --version; if [ -n "'"$SWIFTPM_REF"'" ]; then timeout 60 swift package --version; fi; echo "print(\"hello \\(6 * 7)\")" > /tmp/h.swift; timeout 600 swiftc -O /tmp/h.swift -o /tmp/h; /tmp/h | grep -qx "hello 42"; echo image smoke ok'
           docker run --rm dry-slim bash -c 'ls /usr/lib/swift/linux/libdispatch.so >/dev/null && echo slim smoke ok'
+      # Gate: a macro package with swift-syntax 604.0.0 must build from the baked prebuilts (fails the job otherwise).
+      - name: Test SwiftPM prebuilts in the dry-run image
+        if: ${{ inputs.dry_run && !inputs.publish && env.SWIFTPM_PREBUILTS != '' }}
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/tests:/t:ro" dry-full bash /t/prebuilts-swift-syntax/run.sh | tee test-prebuilts.log
+          { echo "### Prebuilts gate ${{ matrix.arch }}"; echo '```'; grep '^SUMMARY' test-prebuilts.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Build and push by digest
         if: inputs.publish
         run: |
           set -euo pipefail
           mkdir -p digests
           for v in full slim; do
-            if [ $v = full ]; then base="$BASE_IMAGE"; df=docker/Dockerfile; else base="$BASE_IMAGE_SLIM"; df=docker/Dockerfile.slim; fi
+            if [ $v = full ]; then base="$BASE_IMAGE"; df="${DOCKERFILE_FULL:-docker/Dockerfile}"; else base="$BASE_IMAGE_SLIM"; df=docker/Dockerfile.slim; fi
             docker buildx build --platform ${{ matrix.platform }} -f $df --build-arg BASE="$base" \
               --label org.opencontainers.image.source=https://github.com/${{ github.repository }} \
               --label org.opencontainers.image.description="Swift ${SWIFT_VERSION} with backported fixes (${RELEASE_ID})" \
@@ -612,6 +689,11 @@ jobs:
           docker run --rm "${IMAGE}@$(cat digests/full-${{ matrix.arch }})" bash -c \
             'set -e; timeout 60 swift --version; if [ -n "'"$SWIFTPM_REF"'" ]; then timeout 60 swift package --version; fi; echo "print(\"hello \\(6 * 7)\")" > /tmp/h.swift; timeout 600 swiftc -O /tmp/h.swift -o /tmp/h; /tmp/h | grep -qx "hello 42"; echo image smoke ok'
           docker run --rm "${IMAGE}@$(cat digests/slim-${{ matrix.arch }})" bash -c 'ls /usr/lib/swift/linux/libdispatch.so >/dev/null && echo slim smoke ok'
+          # Gate: the SwiftPM prebuilts baked into the pushed full image must be used by a macro package build.
+          if [ -n "${SWIFTPM_PREBUILTS:-}" ]; then
+            docker run --rm -v "$PWD/tests:/t:ro" "${IMAGE}@$(cat digests/full-${{ matrix.arch }})" bash /t/prebuilts-swift-syntax/run.sh | tee test-prebuilts.log
+            grep '^SUMMARY' test-prebuilts.log > digests/prebuilts-summary-${{ matrix.arch }}.txt
+          fi
           cat digests/*
       - uses: actions/upload-artifact@v7
         if: inputs.publish
@@ -633,6 +715,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Load manifest
         run: scripts/load-manifest.sh "${{ needs.meta.outputs.id }}"
+        env:
+          BASE_RESOLVED: ${{ needs.meta.outputs.base }}
+          BASE_SLIM_RESOLVED: ${{ needs.meta.outputs.base_slim }}
       - uses: actions/download-artifact@v8
         with:
           pattern: digests-*
@@ -680,6 +765,18 @@ jobs:
           \`swift sdk install https://github.com/${{ github.repository }}/releases/download/swift-${RELEASE_ID}/${sdk_name} --checksum $(cat dist-sdk/*.checksum)\`
           "
           fi
+          pb_note=""
+          if [ -n "${SWIFTPM_PREBUILTS:-}" ]; then
+            pb_note="
+          **SwiftPM prebuilts** (full images only): the official swift.org swift-syntax prebuilts (\`${SWIFTPM_PREBUILTS}\`, files of \`${SWIFTPM_PREBUILTS_SOURCE_TAG}\`, renamed to the image's compiler tag, byte-identical) are in \`/opt/hyp3r/swiftpm-prebuilts\`; \`HYP3R_SWIFTPM_PREBUILTS_URL\` points there. Use \`swift build --experimental-prebuilts-download-url \"\$HYP3R_SWIFTPM_PREBUILTS_URL\"\` so macro packages that depend on swift-syntax ${SWIFTPM_PREBUILTS#*:} skip compiling it. Gate: a macro package builds from the prebuilt in the published image, both architectures.
+          \`\`\`
+          $(cat digests/prebuilts-*.txt)
+          \`\`\`
+          "
+            case "$SWIFT_VERSION" in 6.4.0) ;; *) pb_note="$pb_note
+          swift.org publishes no swift-syntax prebuilts for ${SWIFT_VERSION}; the ${SWIFTPM_PREBUILTS_SOURCE_TAG} files are used (same swiftmodule format, verified by the gate).
+          " ;; esac
+          fi
           cat > notes.md <<EOF
           Swift ${SWIFT_VERSION} (official release) with backported fixes. Linux only for this release.
 
@@ -689,6 +786,8 @@ jobs:
           **Docker** (drop-in for \`swift:${SWIFT_VERSION}-noble\` / \`-noble-slim\`, amd64 + arm64)
           - \`${IMAGE}:${RELEASE_ID}-noble\`, \`${IMAGE}:${RELEASE_ID}-noble-slim\`
           - moving tags: \`${IMAGE}:${SWIFT_VERSION}-noble\`, \`${IMAGE}:${SWIFT_VERSION}-noble-slim\`
+          - base images (pinned by index digest for this build): \`${BASE_IMAGE}\` (full), \`${BASE_IMAGE_SLIM}\` (slim)
+          ${pb_note:-}
 
           **Tarballs**
           - \`swift-${RELEASE_ID}-ubuntu24.04[-aarch64].tar.gz\`: full official toolchain (signature-verified) with the patched libraries.
