@@ -11,10 +11,21 @@ here="$(cd "$(dirname "$0")" && pwd)"
 url="${HYP3R_SWIFTPM_PREBUILTS_URL:-}"
 fail=0
 bad() { echo "::error::$*"; fail=1; }
-[ -n "$url" ] || { bad "HYP3R_SWIFTPM_PREBUILTS_URL is not set in the image"; echo "SUMMARY $(uname -m) prebuilt_used=no demo=no build_seconds=0 sources_build_seconds=0"; exit 1; }
+[ -n "$url" ] || { bad "HYP3R_SWIFTPM_PREBUILTS_URL is not set in the image"; echo "SUMMARY $(uname -m) checksums_ok=$checked prebuilt_used=no demo=no build_seconds=0 sources_build_seconds=0"; exit 1; }
 swift --version 2>&1 | head -2
 swiftc -print-target-info | grep -E '"(swiftCompilerTag|compilerVersion)"'
 find "${url#file://}" -type f | sort
+
+# SwiftPM verifies the manifest signature for file:// URLs but not the archive checksum (it only does for https), so
+# the baked archives are checked here: every MacroSupport archive must match the checksum in its manifest.
+checked=0
+for j in $(find "${url#file://}" -name '*.json' | sort); do
+  a="${j%.json}-MacroSupport.tar.gz"
+  want=$(sed -n 's/.*"checksum" *: *"\([0-9a-f]\{64\}\)".*/\1/p' "$j" | head -1)
+  got=$(sha256sum "$a" 2>/dev/null | cut -d' ' -f1)
+  if [ -n "$want" ] && [ "$want" = "$got" ]; then checked=$((checked+1)); echo "checksum ok: $(basename "$a") $got"; else bad "checksum mismatch or missing for $a (manifest '$want', file '$got')"; fi
+done
+[ "$checked" -ge 1 ] || bad "no prebuilt archive found under $url"
 
 # build <label> <flags...> -> /tmp/<label>/ with a fresh copy and a fresh SwiftPM prebuilts cache
 build() {
@@ -44,5 +55,5 @@ build without-prebuilts --disable-experimental-prebuilts
 without_secs=$secs; without_compiled=$(compiled without-prebuilts)
 [ "$without_compiled" != 0 ] || echo "::warning::the build without prebuilts compiled no swift-syntax module either; the 'used' check proves less"
 
-echo "SUMMARY $(uname -m) prebuilt_used=$used demo=$([ "$fail" = 0 ] && echo 42 || echo FAIL) with_prebuilts_seconds=$with_secs without_prebuilts_seconds=$without_secs sources_compiled_without=$without_compiled"
+echo "SUMMARY $(uname -m) checksums_ok=$checked prebuilt_used=$used demo=$([ "$fail" = 0 ] && echo 42 || echo FAIL) with_prebuilts_seconds=$with_secs without_prebuilts_seconds=$without_secs sources_compiled_without=$without_compiled"
 exit $fail
