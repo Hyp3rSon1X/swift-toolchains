@@ -3,7 +3,7 @@
 # Gate for the SwiftPM swift-syntax prebuilts baked into the image (/opt/hyp3r/swiftpm-prebuilts, announced in
 # $HYP3R_SWIFTPM_PREBUILTS_URL): a package with a macro target and an exact swift-syntax 604.0.0 dependency must build
 # with `--experimental-prebuilts-download-url`, SwiftPM must take swift-syntax's MacroSupport from the prebuilt (so no
-# SwiftSyntax/SwiftParser object directories exist in .build) and the macro must expand (the executable prints 42).
+# no SwiftSyntax/SwiftParser compiler invocation shows in the -v log) and the macro must expand (the executable prints 42).
 # A second build with --disable-experimental-prebuilts is informational (timing, and proof that the sources do get
 # compiled without the prebuilt, which shows the assertion above can fail).
 set -uo pipefail
@@ -30,8 +30,8 @@ build() {
   [ "$got" = 42 ] || bad "$label: demo printed '$got', not 42"
 }
 
-# swift-syntax sources compiled = per-module object directories in the package build tree
-compiled() { find "/tmp/$1/.build" -type d \( -name SwiftSyntax.build -o -name SwiftParser.build -o -name SwiftSyntaxMacros.build \) 2>/dev/null | wc -l; }
+# swift-syntax sources compiled = -v lines of compiler invocations for the SwiftSyntax/SwiftParser modules
+compiled() { grep -cE -- '-module-name (SwiftSyntax|SwiftParser|SwiftSyntaxMacros|SwiftDiagnostics) ' "/tmp/$1.log" || true; }
 
 build with-prebuilts --experimental-prebuilts-download-url "$url"
 with_secs=$secs; with_compiled=$(compiled with-prebuilts)
