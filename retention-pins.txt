@@ -5,4 +5,5 @@
 # Format: <id>  # <owner>, <date added>, <reason / until>
 6.4.0-hyp3r.15  # Jectiva (jectiva-b4), 2026-10-16: builder FROM registry.hyp3r.dev/swift-toolchains/swift:6.4.0-hyp3r.15-noble@sha256:a5551cf7..., until their wave W12 moves it (SwixForge released it)
 6.4.0-hyp3r.13  # SwixWebSuite Quiver, 2026-10-15: pinned by GHCR digest
-6.4.0-hyp3r.14  # SwixAgent (swixagent-c6) and SwixWarp, 2026-10-16: pinned .14 by digest, registry (mirror or GHCR) unconfirmed; drop once confirmed GHCR-only or moved
+6.4.0-hyp3r.14  # SwixAgent, 2026-10-16: CI FROM registry.hyp3r.dev/swift-toolchains/swift:6.4.0-hyp3r.14-noble@sha256:25d8bc0d... (also Scripts/prepare-e1-released-reproducer.sh), until their bump to 6.4.1-hyp3r.3
+6.4.1-hyp3r.1  # SwixLens, 2026-10-16: CI + v0.1.0-m2.3 on registry.hyp3r.dev/swift-toolchains/swift:6.4.1-hyp3r.1-noble@sha256:8780cd28...; cross image from release asset swift-6.4.1-hyp3r.1-ubuntu24.04-aarch64.tar.gz (f651d76d...), until they bump
