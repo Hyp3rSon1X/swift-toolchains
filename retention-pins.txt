@@ -5,3 +5,4 @@
 # Format: <id>  # <owner>, <date added>, <reason / until>
 6.4.0-hyp3r.15  # Jectiva (jectiva-b4), 2026-10-16: builder FROM registry.hyp3r.dev/swift-toolchains/swift:6.4.0-hyp3r.15-noble@sha256:a5551cf7..., until their wave W12 moves it (SwixForge released it)
 6.4.0-hyp3r.13  # SwixWebSuite Quiver, 2026-10-15: pinned by GHCR digest
+6.4.0-hyp3r.14  # SwixAgent (swixagent-c6) and SwixWarp, 2026-10-16: pinned .14 by digest, registry (mirror or GHCR) unconfirmed; drop once confirmed GHCR-only or moved

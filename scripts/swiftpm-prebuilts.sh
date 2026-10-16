@@ -7,8 +7,9 @@
 #   outdir      receives <package>/<version>/<name>.json and <name>-MacroSupport.tar.gz, <name> = <compilerTag>-ubuntu_noble_<arch>
 # SwiftPM 6.4 looks the files up under that name; <compilerTag> is .swiftCompilerTag of the target info, else the
 # `(swift-...)` part of .compilerVersion. Our Linux frontend has no swiftCompilerTag, so the tag comes from the version
-# string. The signed manifest has no version inside, so the official file stays valid under another name; SwiftPM
-# verifies the archive's sha256 against the manifest, and so do we before anything is baked into an image.
+# string. The signed manifest has no version inside, so the official file stays valid under another name. SwiftPM
+# checks the archive's sha256 only for https downloads, not for file:// URLs, so we verify it against the manifest here,
+# before anything is baked into an image (and tests/prebuilts-swift-syntax re-checks it in the built image).
 # DOCKER overrides the container CLI (e.g. DOCKER="container" for Apple's container tool).
 set -euo pipefail
 image=$1; arch=$2; spec=$3; srctag=$4; out=$5
