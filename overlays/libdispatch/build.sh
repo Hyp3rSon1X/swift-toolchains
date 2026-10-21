@@ -40,7 +40,7 @@ install -m 0755 "$so" "$OUT/usr/lib/swift/linux/libdispatch.so"
 install -m 0644 "$a"  "$OUT/usr/lib/swift_static/linux/libdispatch.a"
 {
   echo "component: libdispatch"
-  echo "source: $(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "source: $(git -c safe.directory="*" -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
   echo "arch: $(uname -m)"
   echo "compiler: $(clang --version | head -1)"
   echo "shared symbols: $(wc -l < "$OUT/checks/shared-built.txt") (identical to stock)"
