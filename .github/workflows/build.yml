@@ -761,6 +761,8 @@ jobs:
           sdk_files=()
           if [ -n "${STATIC_SDK_VERSION:-}" ]; then
             sdk_files=(dist-sdk/*.artifactbundle.tar.gz dist-sdk/*.checksum dist-sdk/MANIFEST-static-sdk.txt)
+            # SHA256SUMS covers every release asset, the static SDK and its manifest included (SwixAgent, 2026-10-24).
+            (cd dist-sdk && sha256sum *.artifactbundle.tar.gz MANIFEST-static-sdk.txt) >> dist/SHA256SUMS
             sdk_name=$(basename dist-sdk/*.artifactbundle.tar.gz)
             sdk_note="
           **Static Linux SDK (musl)**: \`${sdk_name}\`, the official ${SWIFT_VERSION} SDK with libdispatch.a and libFoundation.a rebuilt from the fixes (for \`--swift-sdk\` builds). Checksum: \`$(cat dist-sdk/*.checksum)\`.
