@@ -4,7 +4,7 @@
 #
 # usage: build-swiftpm-toolchain.sh [SWIFT_BUILD_REF] [SWIFTPM_REF] [NAME]
 #   SWIFT_BUILD_REF  ref in repos/swift-build            (default swift-6.4.1-RELEASE; e.g. a patched fork branch)
-#   SWIFTPM_REF      ref in repos/swift-package-manager  (default hyp3r/release/6.4.1)
+#   SWIFTPM_REF      ref in repos/swift-package-manager  (default hyp3r/release/6.4.1; 6.4.2-hyp3r.3: hyp3r/release/6.4.2)
 #   NAME             output name, no extension           (default swiftpm-sc0033-<yyyymmdd>)
 # Output: build/sc0033/out/<NAME>.xctoolchain and <NAME>.tar.xz (+ .sha256)
 # Env: BUNDLE_ID (default dev.hyp3r.swiftpm.sc0033test), TC_VERSION (default 6.4.1.<yyyymmdd>), SKIP_BUILD=1 (reassemble only)
@@ -38,12 +38,24 @@ cd "$W/swiftpm"
 B="$W/swiftpm/.build/out/Products/Release"
 if [ -z "${SKIP_BUILD:-}" ]; then
   # Make SwiftPM use the local swift-build checkout (its other deps resolve from the release/6.4.x branches).
-  [ -e Packages/swift-build ] || swift package edit swift-build --path "$W/swift-build"
+  # The edit lives in .build/workspace-state.json: a Packages/swift-build symlink left over from an earlier build whose
+  # .build was deleted is not enough (the first 6.4.2-hyp3r.3 build silently used upstream swift-build that way).
+  edited() { python3 -c 'import json,sys; d=json.load(open(".build/workspace-state.json")); s=[x["state"] for x in d["object"]["dependencies"] if x["packageRef"]["identity"]=="swift-build"]; sys.exit(0 if s and s[0]["name"]=="edited" and s[0].get("path")==sys.argv[1] else 1)' "$W/swift-build" 2>/dev/null; }
+  if ! edited; then
+    rm -f Packages/swift-build
+    swift package edit swift-build --path "$W/swift-build"
+  fi
+  edited || { echo "FAIL: swift-build is not edited to $W/swift-build"; exit 1; }
   S=$(date +%s)
   # swift-package-manager is the multi-call binary installed as swift-package; the two dylib products carry
   # PackageDescription/CompilerPluginSupport (ManifestAPI) and PackagePlugin (PluginAPI) built from this source.
-  for p in swift-package-manager swiftpm-testing-helper PackageDescription PackagePlugin; do
+  for p in swift-package-manager swiftpm-testing-helper; do
     build-slot swift build -c release --product "$p"
+  done
+  # The manifest and plugin APIs also get textual module interfaces (they are built with -enable-library-evolution),
+  # so any later Xcode compiler can load them; a binary .swiftmodule loads only in the compiler that wrote it.
+  for p in PackageDescription PackagePlugin; do
+    build-slot swift build -c release --product "$p" --enable-parseable-module-interfaces
   done
   echo "build seconds: $(( $(date +%s) - S ))"
 fi
@@ -66,10 +78,23 @@ cp "$B/swiftpm-testing-helper" "$TC/usr/bin/"
 # Resource bundles (xcspecs, platform plugins, crypto) are found next to ../share/pm (same as the swift.org layout).
 cp -R "$B"/*.bundle "$TC/usr/share/pm/"
 cp "$W/swiftpm/Utilities/config.json" "$TC/usr/share/pm/config.json"
+# Modules are installed as Xcode ships them: <triple>.swiftinterface + .swiftdoc, no binary .swiftmodule, so the manifest
+# and plugin compiles of whatever Xcode compiler is active rebuild them from the interface (6.4.1-hyp3r.7 shipped binary
+# modules, which tie the toolchain to the Xcode that built it).
+install_module() { # <module> <dest dir>
+  local src=$B/$1.swiftmodule dst=$2/$1.swiftmodule f n=0
+  mkdir -p "$dst"
+  for f in "$src"/*.swiftinterface "$src"/*.swiftdoc; do
+    case "$f" in *.private.swiftinterface|*.package.swiftinterface|*'*'*) continue;; esac
+    cp "$f" "$dst/"; case "$f" in *.swiftinterface) n=$((n+1));; esac
+  done
+  [ "$n" -gt 0 ] || { echo "no .swiftinterface for $1 in $src"; exit 1; }
+}
 cp "$B/libPackageDescription.dylib" "$TC/usr/lib/swift/pm/ManifestAPI/"
-cp -R "$B/PackageDescription.swiftmodule" "$B/CompilerPluginSupport.swiftmodule" "$TC/usr/lib/swift/pm/ManifestAPI/"
+install_module PackageDescription "$TC/usr/lib/swift/pm/ManifestAPI"
+install_module CompilerPluginSupport "$TC/usr/lib/swift/pm/ManifestAPI"
 cp "$B/libPackagePlugin.dylib" "$TC/usr/lib/swift/pm/PluginAPI/"
-cp -R "$B/PackagePlugin.swiftmodule" "$TC/usr/lib/swift/pm/PluginAPI/"
+install_module PackagePlugin "$TC/usr/lib/swift/pm/PluginAPI"
 
 # Drop machine-specific rpaths (the Metal cryptex path); keep /usr/lib/swift, @loader_path and the Xcode stdlib path.
 for f in "$TC/usr/bin/swift-package" "$TC/usr/bin/swiftpm-testing-helper" "$TC"/usr/lib/swift/pm/*/lib*.dylib; do
