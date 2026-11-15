@@ -514,10 +514,15 @@ jobs:
         run: |
           chmod 0755 swiftpm/usr/bin/swift-package
           docker run --rm --cap-add SYS_PTRACE -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0024-swiftpm-plugin-pipe-eof/run.sh /w/overlay /w/swiftpm/usr/bin/swift-package | tee test-swiftpm.log
+      - name: Test (SC-0033 SwiftBuild honours -no-whole-module-optimization in a release target, stock vs patched swift-package)
+        # Only releases whose SwiftPM deps pin our swift-build fork (deps-6.4.2.txt and later) carry SC-0033.
+        if: hashFiles(format('overlays/swiftpm/deps-{0}.txt', env.SWIFT_VERSION)) != '' && env.SWIFT_VERSION != '6.4.0' && env.SWIFT_VERSION != '6.4.1'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "$BASE_IMAGE" bash tests/SC-0033-swiftbuild-no-wmo/run.sh /w/swiftpm/usr/bin/swift-package | tee test-swiftbuild-wmo.log
       - name: Summary
         if: always()
         run: |
-          { echo "### swiftpm ${{ matrix.arch }}"; echo '```'; grep -hE '^(stock|patched|SUMMARY)' test-swiftpm.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### swiftpm ${{ matrix.arch }}"; echo '```'; grep -hE '^(stock|patched|SUMMARY)' test-swiftpm.log test-swiftbuild-wmo.log 2>/dev/null; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
   package:
     needs: [meta, build, compiler-test, swiftpm-test]
