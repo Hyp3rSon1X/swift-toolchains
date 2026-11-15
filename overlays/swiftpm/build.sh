@@ -71,8 +71,11 @@ install -m 0755 "$destdir/usr/bin/swift-package" "$out/usr/bin/swift-package"
         echo "DIFFER --version: stock '$stock_version', built '$built_version'"; rc=1
     fi
     # Every installed file must exist in the image, with the same type (file or symlink target).
-    missing=0
+    # Test resource bundles are skipped: Utilities/bootstrap installs them (6.4.2: SwiftPM_SBOMModelTests.bundle),
+    # the official toolchain does not ship them, and the overlay replaces only usr/bin/swift-package.
+    missing=0 skipped=0
     while read -r f; do
+        case "$f" in ./usr/share/pm/*Tests.bundle/*) skipped=$((skipped+1)); continue;; esac
         p=/${f#./}
         if [[ -L "$destdir/$f" ]]; then
             [[ -L "$p" && "$(readlink "$p")" == "$(readlink "$destdir/$f")" ]] || { echo "not in image as the same symlink: $p"; missing=1; }
@@ -80,7 +83,7 @@ install -m 0755 "$destdir/usr/bin/swift-package" "$out/usr/bin/swift-package"
             [[ -f "$p" && ! -L "$p" ]] || { echo "not in image: $p"; missing=1; }
         fi
     done < "$out/installed-files.txt"
-    if [[ $missing == 0 ]]; then echo "same   installed file set ($(wc -l < "$out/installed-files.txt") files, all present in the image)"; else rc=1; fi
+    if [[ $missing == 0 ]]; then echo "same   installed file set ($(( $(wc -l < "$out/installed-files.txt") - skipped )) files, all present in the image; $skipped test-bundle files skipped)"; else rc=1; fi
     file "$out/usr/bin/swift-package" | sed 's/^[^:]*: //'
     exit $rc
 } | tee "$out/parity.txt"
