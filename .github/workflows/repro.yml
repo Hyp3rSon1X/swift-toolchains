@@ -1,0 +1,81 @@
+name: repro
+
+# Runs a one-file reproducer from repros/ against several Swift images on GitHub's x86_64 and arm64 runners, to
+# confirm a downstream report and find the affected versions. Informational: the job never fails on the
+# reproducer's result; the step summary has a table per runner. Uploads nothing (no artifacts, no caches).
+on:
+  workflow_dispatch:
+    inputs:
+      file:
+        description: "Reproducer, a path under repros/ (e.g. repros/SC-0036/repro.swift)"
+        required: true
+      images:
+        description: "Space-separated images"
+        required: false
+        default: "swift:6.4.2-noble swift:6.4.1-noble swift:6.4.0-noble swift:6.3-noble swiftlang/swift:nightly-main-noble ghcr.io/hyp3rson1x/swift:6.4.2-hyp3r.1-noble"
+      flags:
+        description: "Space-separated optimization modes, one build per mode"
+        required: false
+        default: "-Onone -O"
+      swiftc_args:
+        description: "Extra swiftc arguments for every build"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repro-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      FILE: ${{ inputs.file }}
+      IMAGES: ${{ inputs.images }}
+      FLAGS: ${{ inputs.flags }}
+      SWIFTC_ARGS: ${{ inputs.swiftc_args }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the input
+        run: |
+          case "$FILE" in repros/*.swift) ;; *) echo "::error::file must be repros/<...>.swift"; exit 1;; esac
+          case "$FILE" in *..*) echo "::error::no .. in file"; exit 1;; esac
+          [ -f "$FILE" ] || { echo "::error::$FILE not found"; exit 1; }
+      - name: Run the reproducer per image and mode
+        run: |
+          { echo "### ${{ matrix.arch }}: $FILE"; echo; echo "| image | swift | mode | build | run exit | output |"; echo "|-|-|-|-|-|-|"; } >> "$GITHUB_STEP_SUMMARY"
+          for image in $IMAGES; do
+            docker pull -q "$image" >/dev/null 2>&1 || { echo "| $image | pull failed | | | | |" >> "$GITHUB_STEP_SUMMARY"; continue; }
+            for mode in $FLAGS; do
+              echo "::group::$image $mode"
+              out=$(docker run --rm -v "$PWD:/w:ro" -e FILE -e MODE="$mode" -e SWIFTC_ARGS "$image" bash -c '
+                v=$(swiftc --version 2>&1 | head -1 | sed -E "s/.*Swift version ([^ ]+( \([^)]*\))?).*/\1/")
+                if swiftc $MODE $SWIFTC_ARGS "/w/$FILE" -o /tmp/r >/tmp/build.log 2>&1; then b=ok
+                else b="fail: $(grep -m1 -E "error|Assertion|verification" /tmp/build.log | cut -c1-120)"; fi
+                if [ "$b" = ok ]; then timeout 120 /tmp/r >/tmp/run.log 2>&1; rc=$?
+                else rc=-; : >/tmp/run.log; fi
+                cat /tmp/build.log /tmp/run.log >&2
+                o=$(grep -m1 -E "crashed|Fatal|error|^[^*[:space:]]" /tmp/run.log | cut -c1-100)
+                printf "%s\t%s\t%s\t%s\n" "$v" "$b" "$rc" "$o"')
+              echo "$out"
+              echo "::endgroup::"
+              IFS=$'\t' read -r v b rc o <<<"$out"
+              o=${o//|/\\|}; b=${b//|/\\|}
+              echo "| $image | $v | $mode | $b | $rc | $o |" >> "$GITHUB_STEP_SUMMARY"
+            done
+            docker image rm -f "$image" >/dev/null 2>&1 || true
+          done
