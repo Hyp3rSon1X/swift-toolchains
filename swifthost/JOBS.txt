@@ -1,0 +1,147 @@
+SwiftHostCompiler job recipe (swifthost-6.4.2-N)
+================================================
+
+How to turn Swift sources into a WASI command module (.wasm) with the three
+library calls, against the swift.org Swift SDK for WebAssembly
+swift-6.4.2-RELEASE_wasm
+(artifactbundle SHA-256 83baca83553f8c443cda7b84800912e6e709c3acd2e7ebf277794ca5836c0da5).
+
+These are the jobs `swiftc -target wasm32-unknown-wasip1 -static-stdlib` runs
+with that SDK, minus the out-of-process pieces (driver, clang link driver,
+macro plugin server). Every argument goes in its own argv element; nothing is
+shell-expanded.
+
+Placeholders
+------------
+
+  $SDK    absolute path of the SDK's target directory:
+          <bundle>/swift-6.4.2-RELEASE_wasm/wasm32-unknown-wasip1
+  $SW     $SDK/swift.xctoolchain/usr/lib/swift_static
+  $CACHE  writable directory for the clang module cache (keep it between
+          builds; the first build fills it with the WASILibc and SwiftShims
+          modules, later builds reuse them)
+  $SRC    the Swift source files (one or more)
+  $NAME   the module name (a valid Swift identifier, e.g. main)
+  $OBJ    output object, e.g. $TMP/main.o
+  $AL     autolink output, e.g. $TMP/main.autolink
+  $WASM   output module, e.g. $TMP/main.wasm
+
+Step 1: compile (swifthost_swift_frontend)
+------------------------------------------
+
+Debug (-Onone):
+
+  swift-frontend
+  -c $SRC...
+  -target wasm32-unknown-wasip1
+  -disable-objc-interop
+  -sdk $SDK/WASI.sdk
+  -resource-dir $SW
+  -use-static-resource-dir
+  -module-cache-path $CACHE
+  -no-color-diagnostics
+  -Xcc -fno-color-diagnostics
+  -empty-abi-descriptor
+  -no-auto-bridging-header-chaining
+  -module-name $NAME
+  -o $OBJ
+
+Release (-O): the same, plus
+
+  -O
+  -enable-default-cmo
+
+All sources go into one call and one object (whole-module mode, which
+`-Onone` supports too). Per-file incremental builds are possible with
+`-primary-file` and one object per file, but are not covered here.
+
+Optional: `-g` for DWARF in the object (wasm-ld keeps it in custom sections);
+`-swift-version 5` or `-swift-version 6` (the default is 5, as with swiftc);
+`-parse-as-library` when the code has an `@main` type instead of top-level
+code.
+
+Not available: macros (#Predicate, @Observable, #expect, ...). They need the
+out-of-process macro plugin server and plugin dylibs, which this library does
+not include; using one fails with "external macro implementation ... could not
+be found".
+
+Step 2: extract autolink entries (swifthost_swift_autolink_extract)
+-------------------------------------------------------------------
+
+  swift-autolink-extract
+  $OBJ
+  -o $AL
+
+$AL then holds one linker argument per line (for example -lswiftCore,
+-lFoundation, -lCoreFoundation, -l_FoundationICU, ...). wasm-ld does not read
+Swift's autolink section itself, so this step is required.
+
+Step 3: link (swifthost_wasm_ld)
+--------------------------------
+
+  wasm-ld
+  -m wasm32
+  -L$SW/wasi
+  -L$SDK/WASI.sdk/lib/wasm32-wasip1
+  $SDK/WASI.sdk/lib/wasm32-wasip1/crt1-command.o
+  $SW/wasi/wasm32/swiftrt.o
+  $OBJ
+  <each non-empty line of $AL, in order>
+  -lswiftSwiftOnoneSupport
+  -ldl
+  -lc++
+  -lc++abi
+  -lm
+  -lwasi-emulated-mman
+  -lwasi-emulated-signal
+  -lwasi-emulated-process-clocks
+  --error-limit=0
+  --threads=1
+  --global-base=4096
+  --table-base=4096
+  -z stack-size=131072
+  -lc
+  $SW/clang/lib/wasip1/libclang_rt.builtins-wasm32.a
+  -o $WASM
+
+`-z stack-size=131072` is the program's own wasm stack (128 KiB, the swiftc
+default); raise it for deeply recursive programs. Add `--strip-debug` or
+`--strip-all` to shrink the output. `--threads=1` keeps wasm-ld from starting
+worker threads.
+
+Recommended for running untrusted or user-written programs: put the stack
+below the data, so that a stack overflow traps instead of silently
+overwriting globals and heap. Replace `--global-base=4096` with
+
+  --stack-first
+  --global-base=<stack size>
+
+and use the same <stack size> in `-z stack-size=<stack size>` (for example
+1048576). With the default layout (data first, stack after it, growing down
+into the data), a program that recursed through about 400 KiB of a 128 KiB
+stack ended in an unrelated trap in WAMR; with `--stack-first` the same
+program trapped with "out of bounds memory access" at the overflow.
+`--global-base` must be at least the stack size in this mode.
+
+Running the output
+------------------
+
+$WASM is a WASI preview 1 command (`_start` export). It imports only
+`wasi_snapshot_preview1` functions. Tested with WAMR 2.4.5 (fast
+interpreter, software bounds checks, hardware bound checks disabled).
+
+Return values
+-------------
+
+0 = success. Compile errors return 1 with diagnostics on err_fd. 124 =
+SWIFTHOST_ECANCELED (swifthost_request_cancel() stopped this frontend call;
+the library stays usable). 125 = SWIFTHOST_EPOISONED (the compiler crashed in
+this process, in an earlier call or in this one; restart the process). 128+N =
+this call crashed with signal N (a stack overflow on the calling thread
+included) and was recovered. A crash on the compiler's helper thread (clang
+module build) returns the compiler's error status, usually 1. After a crash
+(128+N, a helper-thread crash, or 125 itself) every later call returns 125;
+a cancelled call (124) does not affect later calls. Options that make LLVM
+exit (`-Xllvm -version`, `-Xllvm -help`, an unknown `-Xllvm` option) are
+handled like a crash: the call returns 125 (or its error status) and the
+library stays poisoned.

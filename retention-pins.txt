@@ -2,6 +2,7 @@
 # and the same tags in registry.hyp3r.dev. One id per line; trailing comments allowed. A pin is added with owner and
 # date, and removed (in a commit) as soon as the consumer has moved on. Pinned ids do not count against the keep limits
 # (KEEP_RELEASES_PER_LINE, KEEP_IMAGE_VERSIONS, the mirror's newest 3), so a pin never evicts an unpinned release.
+# A swifthost-<version>-<n> line pins the GitHub release of that name (no images).
 # Format: <id>  # <owner>, <date added>, <reason / until>
 6.4.0-hyp3r.15  # SwixCode (GHCR digest, builder+workflows), 2026-10-16: until SwixCode moves (Jectiva released it 2026-10-22 after its W12 bump to .17) + SwixWebSuite, 2026-11-16: noble image @sha256:a5551cf7... (Swazor, SwixPulse, QuiX, umbrella CI), static-linux 0.1.0 bundle (Swazor, SwixPulse, QuiX), ubuntu24.04 tarball (Swazor qt-ci image), until they move (planned: 6.4.2-hyp3r.1 after their current milestone). Until ALL have moved
 6.4.0-hyp3r.13  # SwixWebSuite Quiver, 2026-10-15: pinned by GHCR digest; Quiver CI image @sha256:845095d5... (Quiver retired, keep per SwixWebSuite 2026-11-16)
@@ -15,3 +16,4 @@
 6.4.2-hyp3r.6  # macOS app (opt-in custom compiler path), 2026-11-17: planned runtime donor (replaces its 6.4.0-hyp3r.6 pin when that lands). macOS only: no image tags
 6.4.2-hyp3r.7  # Linux service CI, 2026-11-17: full image @sha256:eca82664... and slim @sha256:7b25b1bf... (GHCR and registry.hyp3r.dev), static SDK swift-6.4.2-hyp3r.7_static-linux-0.1.0 (11823c5c...), until it moves
 6.4.2-hyp3r.8  # same project, 2026-11-17: macOS compiler swift-6.4.2-hyp3r.8.xctoolchain for its static-SDK guest builds, until it moves. macOS only: no image tags
+swifthost-6.4.2-1  # in-process compiler xcframework for an iOS app, 2026-11-17: pinned by URL, size and SHA-256 of every asset; never replaced

@@ -46,14 +46,16 @@ jobs:
         run: |
           set -euo pipefail
           scripts/retention-pins.sh > pins.txt
-          # GitHub release tags and GHCR tag patterns of the pinned ids
-          sed 's/^/swift-/' pins.txt > pin-release-tags.txt
+          # GitHub release tags and GHCR tag patterns of the pinned ids (swifthost-* ids are release tags already and
+          # have no images)
+          sed -E '/^swifthost-/!s/^/swift-/' pins.txt > pin-release-tags.txt
+          grep -v '^swifthost-' pins.txt > image-pins.txt || true
           # Pinned ids do not count against keep-n-tagged: the action's docs do not say whether excluded tags are
           # counted, so the keep is raised by the 2 tags (full, slim) per pin; either way the newest unpinned
           # releases keep their full KEEP_IMAGE_VERSIONS and the pinned tags are never candidates for deletion.
-          pins=$(wc -l < pins.txt | tr -d ' ')
+          pins=$(wc -l < image-pins.txt | tr -d ' ')
           excl="latest,*-latest"
-          while read -r id; do excl="$excl,${id}-noble,${id}-noble-slim"; done < pins.txt
+          while read -r id; do excl="$excl,${id}-noble,${id}-noble-slim"; done < image-pins.txt
           { echo "GHCR_EXCLUDE=$excl"; echo "GHCR_KEEP=$(( KEEP_IMAGE_VERSIONS + 2 * pins ))"; } >> "$GITHUB_ENV"
           echo "pinned: $(tr '\n' ' ' < pins.txt); GHCR exclude: $excl; GHCR keep: $(( KEEP_IMAGE_VERSIONS + 2 * pins ))"
 
@@ -75,8 +77,9 @@ jobs:
           # 5th column: platform. macOS releases (any asset named *-macos-*; they also carry SHA256SUMS) and Linux
           # releases are separate lines, so a run of macOS respins never prunes the newest Linux release (and vice
           # versa). Requiring *every* asset to be *-macos-* misfiled macOS releases with SHA256SUMS as Linux (2026-10-12).
+          # swifthost-* releases (the in-process compiler xcframework) are their own platform.
           gh api --paginate "repos/$REPO/releases?per_page=100" \
-            -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)\t\(if any(.assets[]; .name | test("-macos-")) then "macos" else "linux" end)"' > releases.tsv
+            -q '.[] | "\(.id)\t\(.tag_name)\t\(.prerelease)\t\(.created_at)\t\(if (.tag_name | startswith("swifthost-")) then "swifthost" elif any(.assets[]; .name | test("-macos-")) then "macos" else "linux" end)"' > releases.tsv
           # pre-releases by age
           while IFS=$'\t' read -r id tag pre created platform; do
             if grep -qxF "$tag" pin-release-tags.txt; then echo "pinned, kept: $tag"; continue; fi
@@ -85,10 +88,11 @@ jobs:
               [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
             fi
           done < releases.tsv
-          # full releases: keep newest N per line (tag minus the trailing .<n>, per platform)
+          # full releases: keep newest N per line (tag minus the trailing .<n>, or -<n> for swifthost-<version>-<n>,
+          # per platform)
           # pinned releases are neither deleted nor counted towards the newest N of their line
           awk -F'\t' '$3=="false"' releases.tsv | { grep -vF -f <(awk '{ print "\t" $0 "\t" }' pin-release-tags.txt) || true; } | sort -t$'\t' -k4,4r |
-          awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/\.[0-9]+$/,"",line); line=line "/" $5; if (++seen[line] > keep) print $2}' |
+          awk -F'\t' -v keep="$KEEP_RELEASES_PER_LINE" '{line=$2; sub(/[.-][0-9]+$/,"",line); line=line "/" $5; if (++seen[line] > keep) print $2}' |
           while read -r tag; do
             echo "release $tag (beyond newest $KEEP_RELEASES_PER_LINE of its line)"
             [ "$DRY" = true ] || gh release delete "$tag" -R "$REPO" --yes --cleanup-tag

@@ -1,0 +1,4 @@
+module SwiftHostCompiler {
+  header "SwiftHostCompiler.h"
+  export *
+}
