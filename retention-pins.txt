@@ -17,3 +17,4 @@
 6.4.2-hyp3r.7  # Linux service CI, 2026-11-17: full image @sha256:eca82664... and slim @sha256:7b25b1bf... (GHCR and registry.hyp3r.dev), static SDK swift-6.4.2-hyp3r.7_static-linux-0.1.0 (11823c5c...), until it moves
 6.4.2-hyp3r.8  # same project, 2026-11-17: macOS compiler swift-6.4.2-hyp3r.8.xctoolchain for its static-SDK guest builds, until it moves. macOS only: no image tags
 swifthost-6.4.2-1  # in-process compiler xcframework for an iOS app, 2026-11-17: pinned by URL, size and SHA-256 of every asset; never replaced
+6.4.2-hyp3r.9  # macOS app (opt-in custom compiler path, runtime donor) and the Linux service project (macOS compiler for its static-SDK guest builds), 2026-11-18: planned, replaces their 6.4.2-hyp3r.6 / 6.4.2-hyp3r.8 pins once they have moved. macOS only: no image tags
