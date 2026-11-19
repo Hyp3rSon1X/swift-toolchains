@@ -15,31 +15,34 @@
 # Every step is re-runnable: cmake and ninja continue where they stopped.
 #
 # Environment:
-#   SRC      source checkouts (default ./src): swift, llvm-project, cmark, swift-experimental-string-processing
+#   SRC      source checkouts (default ./src): swift, llvm-project, cmark, swift-experimental-string-processing,
+#            swift-syntax
 #   BUILD    build root (default ./build); a slice needs about 1 GB
 #   NATIVE   directory with host llvm-tblgen and clang-tblgen (default $BUILD/native/bin)
 #   JOBS     parallel jobs (default: all cores)
 #   VERSION  version label compiled into the compiler and returned by swifthost_version()
-#            (default swifthost-6.4.2-1, whatever id package gets); set it to the release id
+#            (default swifthost-6.4.2-2, whatever id package gets); set it to the release id
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$(mkdir -p "${SRC:-src}" && cd "${SRC:-src}" && pwd)
 BUILD=$(mkdir -p "${BUILD:-build}" && cd "${BUILD:-build}" && pwd)
 NATIVE=${NATIVE:-$BUILD/native/bin}
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
-VERSION=${VERSION:-swifthost-6.4.2-1}
+VERSION=${VERSION:-swifthost-6.4.2-2}
 CC=$(xcrun -f clang)
 CXX=$(xcrun -f clang++)
 
 # Pinned sources. swift and llvm-project carry the patches listed in the README.
 SWIFT_REPO=https://github.com/Hyp3rSon1X/swift.git
-SWIFT_COMMIT=8e7c4d1b6a1c826e7abe3246721f6291a5f17159
+SWIFT_COMMIT=320cb47426b5cfeb59909deb4b3eb0453a9bdc43
 LLVM_REPO=https://github.com/Hyp3rSon1X/llvm-project.git
 LLVM_COMMIT=af10e9a7844d303de78404f574a453912edcee77
 CMARK_REPO=https://github.com/swiftlang/swift-cmark.git
 CMARK_TAG=swift-6.4.2-RELEASE
 STRING_PROCESSING_REPO=https://github.com/swiftlang/swift-experimental-string-processing.git
 STRING_PROCESSING_TAG=swift-6.4.2-RELEASE
+SWIFT_SYNTAX_REPO=https://github.com/swiftlang/swift-syntax.git
+SWIFT_SYNTAX_TAG=swift-6.4.2-RELEASE
 
 slice_vars() {
   case $1 in
@@ -66,6 +69,7 @@ cmd_sources() {
   checkout llvm-project "$LLVM_REPO" "$LLVM_COMMIT"
   checkout cmark "$CMARK_REPO" "refs/tags/$CMARK_TAG"
   checkout swift-experimental-string-processing "$STRING_PROCESSING_REPO" "refs/tags/$STRING_PROCESSING_TAG"
+  checkout swift-syntax "$SWIFT_SYNTAX_REPO" "refs/tags/$SWIFT_SYNTAX_TAG"
 }
 
 cmd_native() {
@@ -115,8 +119,12 @@ cmd_slice() {
 
   # 3. Swift compiler libraries. Like build-script, Swift keeps
   # CMAKE_SYSTEM_NAME=Darwin and takes the host from SWIFT_HOST_VARIANT_SDK;
-  # the iOS SDK comes from the sysroot and -target. SwiftCompilerSources are
-  # compiled with Xcode's swiftc (hosttools). No swift-syntax, so no macros.
+  # the iOS SDK comes from the sysroot and -target. SwiftCompilerSources,
+  # swift-syntax and ASTGen are compiled with Xcode's swiftc (hosttools).
+  # swift-syntax is built as static libraries (macros, linked into the
+  # prelinked object); executable plugins are compiled out (no spawning).
+  # The plugin server tool stays configured (swift-frontend depends on its
+  # in-process library target when swift-syntax is on) but is never built.
   if [[ ! -f $B/build.ninja ]]; then
     local deployment=27.0
     [[ $SYS == Darwin ]] || deployment=
@@ -131,7 +139,9 @@ cmd_slice() {
       -DSWIFT_PRIMARY_VARIANT_ARCH=arm64 \
       -DSWIFT_DARWIN_DEPLOYMENT_VERSION_IOS=27.0 -DSWIFT_DARWIN_DEPLOYMENT_VERSION_OSX=27.0 \
       -DBOOTSTRAPPING_MODE=HOSTTOOLS -DSWIFT_ENABLE_SWIFT_IN_SWIFT=ON \
-      -DSWIFT_BUILD_SWIFT_SYNTAX=OFF -DSWIFT_BUILD_REGEX_PARSER_IN_COMPILER=ON \
+      -DSWIFT_BUILD_SWIFT_SYNTAX=ON -DSWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE="$SRC/swift-syntax" \
+      -DSWIFT_COMPILER_SWIFT_SYNTAX_STATIC=ON -DSWIFT_DISABLE_EXECUTABLE_PLUGINS=ON \
+      -DSWIFT_BUILD_REGEX_PARSER_IN_COMPILER=ON \
       -DSWIFT_PATH_TO_STRING_PROCESSING_SOURCE="$SRC/swift-experimental-string-processing" \
       -DSWIFT_BUILD_STDLIB=OFF -DSWIFT_BUILD_SDK_OVERLAY=OFF -DSWIFT_BUILD_DYNAMIC_STDLIB=OFF \
       -DSWIFT_BUILD_STATIC_STDLIB=OFF -DSWIFT_BUILD_DYNAMIC_SDK_OVERLAY=OFF \
@@ -148,7 +158,7 @@ cmd_slice() {
       -DSWIFT_TOOL_SWIFT_COMPATIBILITY_SYMBOLS_BUILD=OFF -DSWIFT_TOOL_SWIFT_DEF_TO_STRINGS_CONVERTER_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_DEMANGLE_BUILD=OFF -DSWIFT_TOOL_SWIFT_DEMANGLE_YAMLDUMP_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_FUNCTION_CALLER_GENERATOR_BUILD=OFF -DSWIFT_TOOL_SWIFT_IDE_TEST_BUILD=OFF \
-      -DSWIFT_TOOL_SWIFT_PLUGIN_SERVER_BUILD=OFF -DSWIFT_TOOL_SWIFT_REFACTOR_BUILD=OFF \
+      -DSWIFT_TOOL_SWIFT_PLUGIN_SERVER_BUILD=ON -DSWIFT_TOOL_SWIFT_REFACTOR_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_REFLECTION_DUMP_BUILD=OFF -DSWIFT_TOOL_SWIFT_REMOTEAST_TEST_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_SCAN_TEST_BUILD=OFF -DSWIFT_TOOL_SWIFT_SERIALIZE_DIAGNOSTICS_BUILD=OFF \
       -DSWIFT_NATIVE_LLVM_TOOLS_PATH="$NATIVE" -DSWIFT_NATIVE_CLANG_TOOLS_PATH="$NATIVE" \
@@ -159,7 +169,8 @@ cmd_slice() {
       -DLLVM_ENABLE_ASSERTIONS=OFF
   else
     # An existing tree: apply the version label of this run (it is compiled into swifthost_version()).
-    cmake -B "$B" -DSWIFT_TOOLCHAIN_VERSION="$VERSION" >/dev/null
+    # (-S too: with -B alone CMake takes the current directory as the source.)
+    cmake -S "$SRC/swift" -B "$B" -DSWIFT_TOOLCHAIN_VERSION="$VERSION" >/dev/null
   fi
   # Only the archives on swift-frontend's link line: the executable itself
   # needs host-run tools that a cross build cannot run.
@@ -187,13 +198,23 @@ cmd_slice() {
   while read -r a; do
     case $a in /*) archives+=("$a");; *) archives+=("$B/$a");; esac
   done < <(cd "$B" && ninja -t commands bin/swift-frontend | tail -1 | tr ' ' '\n' | grep -E '\.a$' | awk '!s[$0]++')
-  printf '_swifthost_version\n_swifthost_swift_frontend\n_swifthost_swift_autolink_extract\n_swifthost_wasm_ld\n_swifthost_request_cancel\n' \
-    > "$O/exports.txt"
+  printf '%s\n' _swifthost_version _swifthost_swift_frontend _swifthost_swift_autolink_extract _swifthost_wasm_ld \
+    _swifthost_request_cancel _swifthost_set_plugin_message_handler > "$O/exports.txt"
+  archives+=("$L/lib/liblldWasm.a" "$L/lib/liblldCommon.a")
+  # Swift libraries built by CMake (swift-syntax, ASTGen, the regex parser)
+  # carry autolink entries for themselves (-l_CompilerSwiftSyntax, ...). They
+  # are linked into the object, so drop those entries; the app's link would
+  # warn about each library it cannot find.
+  local ignored=()
+  for a in "${archives[@]}"; do
+    a=${a##*/} a=${a#lib}
+    ignored+=(-ignore_auto_link_library "${a%.a}")
+  done
   xcrun ld -r -arch arm64 -platform_version $PLAT 27.0 "$SDKVER" -exported_symbols_list "$O/exports.txt" \
-    -o "$O/SwiftHostCompiler.o" "$O/SwiftHostCompiler-shim.o" "${archives[@]}" "$L/lib/liblldWasm.a" "$L/lib/liblldCommon.a"
+    "${ignored[@]}" -o "$O/SwiftHostCompiler.o" "$O/SwiftHostCompiler-shim.o" "${archives[@]}"
   local exported
   exported=$(xcrun nm -gU "$O/SwiftHostCompiler.o" | awk '{print $3}' | sort | tr '\n' ' ')
-  if [[ $exported != "_swifthost_request_cancel _swifthost_swift_autolink_extract _swifthost_swift_frontend _swifthost_version _swifthost_wasm_ld " ]]; then
+  if [[ $exported != "$(sort "$O/exports.txt" | tr '\n' ' ')" ]]; then
     echo "unexpected exported symbols: $exported" >&2
     exit 1
   fi
@@ -228,6 +249,7 @@ cmd_package() {
   cp "$SRC/swift/LICENSE.txt" "$D/licenses/swift-LICENSE.txt"
   cp "$SRC/cmark/COPYING" "$D/licenses/swift-cmark-COPYING"
   cp "$SRC/swift-experimental-string-processing/LICENSE.txt" "$D/licenses/swift-experimental-string-processing-LICENSE.txt"
+  cp "$SRC/swift-syntax/LICENSE.txt" "$D/licenses/swift-syntax-LICENSE.txt"
   cp -R "$D/licenses" "$D/SwiftHostCompiler.xcframework/licenses"
   (cd "$D" && ditto -c -k --sequesterRsrc --keepParent SwiftHostCompiler.xcframework "SwiftHostCompiler-$id.xcframework.zip")
   cp "$HERE/JOBS.txt" "$D/JOBS.txt"
