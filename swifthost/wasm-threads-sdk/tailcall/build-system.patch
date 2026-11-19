@@ -1,0 +1,43 @@
+diff --git a/utils/swift_build_support/swift_build_support/products/wasistdlib.py b/utils/swift_build_support/swift_build_support/products/wasistdlib.py
+index b99b56f1582..e1536f93f3f 100644
+--- a/utils/swift_build_support/swift_build_support/products/wasistdlib.py
++++ b/utils/swift_build_support/swift_build_support/products/wasistdlib.py
+@@ -301,11 +301,15 @@ class WASIThreadsStdlib(WASIStdlib):
+ 
+     def add_extra_cmake_options(self):
+         self.cmake_options.define('SWIFT_THREADING_PACKAGE:STRING', 'pthreads')
++        # -mtail-call enables the tail-call proposal, so clang accepts
++        # swiftasynccall (the runtime's SWIFT_CC(swiftasync)) and IRGen picks
++        # swifttailcc + musttail: async code no longer nests a frame per await.
+         self.cmake_options.define('SWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS:STRING',
+                                   '-mthread-model;posix;-pthread;'
+-                                  '-ftls-model=local-exec')
++                                  '-ftls-model=local-exec;-mtail-call')
+         self.cmake_options.define('SWIFT_STDLIB_EXTRA_SWIFT_COMPILE_FLAGS:STRING',
+                                   '-Xcc;-matomics;-Xcc;-mbulk-memory;'
+                                   '-Xcc;-mthread-model;-Xcc;posix;'
+-                                  '-Xcc;-pthread;-Xcc;-ftls-model=local-exec')
++                                  '-Xcc;-pthread;-Xcc;-ftls-model=local-exec;'
++                                  '-Xcc;-mtail-call')
+         self.cmake_options.define('SWIFT_ENABLE_WASI_THREADS:BOOL', 'TRUE')
+diff --git a/utils/swift_build_support/swift_build_support/products/wasiswiftsdk.py b/utils/swift_build_support/swift_build_support/products/wasiswiftsdk.py
+index 316b3e5545f..623e2dfbd99 100644
+--- a/utils/swift_build_support/swift_build_support/products/wasiswiftsdk.py
++++ b/utils/swift_build_support/swift_build_support/products/wasiswiftsdk.py
+@@ -59,11 +59,14 @@ class WASISwiftSDK(product.Product):
+         c_flags = ['-resource-dir', clang_resource_dir]
+         cxx_flags = c_flags + ['-fno-exceptions']
+         if has_pthread:
+-            clang_flags = ['-mthread-model', 'posix', '-pthread']
++            # -mtail-call: the threads stdlib is built with the tail-call
++            # proposal (swifttailcc), so its libraries must match.
++            clang_flags = ['-mthread-model', 'posix', '-pthread', '-mtail-call']
+             c_flags.extend(clang_flags)
+             cxx_flags.extend(clang_flags)
+             swift_flags.extend(['-Xcc', '-matomics', '-Xcc', '-mbulk-memory',
+-                               '-Xcc', '-mthread-model', '-Xcc', 'posix', '-Xcc', '-pthread'])
++                               '-Xcc', '-mthread-model', '-Xcc', 'posix', '-Xcc', '-pthread',
++                               '-Xcc', '-mtail-call'])
+ 
+         cmake_options.define('CMAKE_Swift_FLAGS', ' '.join(swift_flags))
+         cmake_options.define('CMAKE_C_FLAGS', ' '.join(c_flags))

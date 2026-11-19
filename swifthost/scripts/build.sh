@@ -9,7 +9,7 @@
 #                                    from all three slices, in $BUILD/dist/<release-id>
 #
 # For a release, set VERSION to the release id for the slice steps and pass the same id to package:
-#   export VERSION=swifthost-6.4.2-2; build.sh slice iphoneos; ...; build.sh package "$VERSION"
+#   export VERSION=swifthost-6.4.2-3; build.sh slice iphoneos; ...; build.sh package "$VERSION"
 #
 # <slice> is iphoneos, iphonesimulator or macosx (all arm64, deployment target 27.0).
 # Every step is re-runnable: cmake and ninja continue where they stopped.
@@ -21,22 +21,22 @@
 #   NATIVE   directory with host llvm-tblgen and clang-tblgen (default $BUILD/native/bin)
 #   JOBS     parallel jobs (default: all cores)
 #   VERSION  version label compiled into the compiler and returned by swifthost_version()
-#            (default swifthost-6.4.2-2, whatever id package gets); set it to the release id
+#            (default swifthost-6.4.2-3, whatever id package gets); set it to the release id
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$(mkdir -p "${SRC:-src}" && cd "${SRC:-src}" && pwd)
 BUILD=$(mkdir -p "${BUILD:-build}" && cd "${BUILD:-build}" && pwd)
 NATIVE=${NATIVE:-$BUILD/native/bin}
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
-VERSION=${VERSION:-swifthost-6.4.2-2}
+VERSION=${VERSION:-swifthost-6.4.2-3}
 CC=$(xcrun -f clang)
 CXX=$(xcrun -f clang++)
 
 # Pinned sources. swift and llvm-project carry the patches listed in the README.
 SWIFT_REPO=https://github.com/Hyp3rSon1X/swift.git
-SWIFT_COMMIT=876747e77e7e6f81855879912165c31484ef5c8d
+SWIFT_COMMIT=a76565c359a095385d56f2ecb80db9f72df043f0
 LLVM_REPO=https://github.com/Hyp3rSon1X/llvm-project.git
-LLVM_COMMIT=af10e9a7844d303de78404f574a453912edcee77
+LLVM_COMMIT=e9a6797a92ff70f31318833c2539a129734ebe9c
 CMARK_REPO=https://github.com/swiftlang/swift-cmark.git
 CMARK_TAG=swift-6.4.2-RELEASE
 STRING_PROCESSING_REPO=https://github.com/swiftlang/swift-experimental-string-processing.git

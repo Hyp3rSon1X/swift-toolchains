@@ -1,8 +1,12 @@
 # Swift 6.4.2 SDK for WebAssembly with threads
 
-Recipe for the `swifthost-sdk-wasip1-threads-6.4.2-*` releases: a Swift SDK artifact bundle
+Recipe for the `swifthost-sdk-wasip1-threads-6.4.2-1` release: a Swift SDK artifact bundle
 (`swift-6.4.2-RELEASE_wasm-threads`) for the target `wasm32-unknown-wasip1-threads`, built from the unmodified
 `swift-6.4.2-RELEASE` sources.
+
+[`tailcall/`](tailcall/README.md) builds `swifthost-sdk-wasip1-threads-6.4.2-2`
+(`swift-6.4.2-RELEASE_wasm-threads-tailcall`): the same target with WebAssembly tail calls for async code, from swift
+and llvm-project sources with upstream fixes picked.
 
 Upstream 6.4.2 already builds this target. `wasiswiftsdk.py` builds the threads stdlib, Foundation, swift-testing and
 XCTest, but packages only `wasm32-unknown-wasip1` (`build_sdk=False` for threads). This recipe runs upstream's build and

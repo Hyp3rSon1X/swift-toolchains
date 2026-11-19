@@ -13,7 +13,9 @@ upstream fixes (or fixes we intend to upstream), built from public forks under t
   (xcframework for iOS, the iOS simulator and macOS) that compiles Swift to WebAssembly; see [`swifthost/`](swifthost/README.md).
 - `swifthost-sdk-wasip1-threads-<version>-<n>`: a Swift SDK artifact bundle for `wasm32-unknown-wasip1-threads`, built from
   the unmodified upstream release sources (upstream builds this target but does not package it); see
-  [`swifthost/wasm-threads-sdk/`](swifthost/wasm-threads-sdk/README.md).
+  [`swifthost/wasm-threads-sdk/`](swifthost/wasm-threads-sdk/README.md). From `6.4.2-2`, the bundle
+  (`swift-6.4.2-RELEASE_wasm-threads-tailcall`) is built with WebAssembly tail calls for async code, from sources with
+  upstream fixes picked; see [`swifthost/wasm-threads-sdk/tailcall/`](swifthost/wasm-threads-sdk/tailcall/README.md).
 
 Every fix ships with a reproducer under `tests/` that must fail on the official release and pass on ours,
 on x86_64 and aarch64.

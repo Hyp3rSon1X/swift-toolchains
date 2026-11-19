@@ -110,6 +110,32 @@ also on the compiler's 8 MiB helper thread when a module is rebuilt from its `.s
 handler there ends the process. Executable plugins (`-load-plugin-executable`, `-external-plugin-path`) are compiled
 out: they fail with "executable plugins are not supported in this build", and no process is started.
 
+## Async code and WebAssembly tail calls
+
+Swift 6.4.2 compiles async functions for WebAssembly without tail calls: an `await` that completes without
+suspending leaves a frame on the WebAssembly stack until the task next suspends. A long run of such awaits, for
+example a loop that awaits a function that never suspends, overflows the stack (after 1,000 to 6,000 awaits with a 1 MiB
+stack).
+
+From `swifthost-6.4.2-3`, compile with `-Xcc -mtail-call` (the `tail-call` WebAssembly feature). Async functions then
+use the `swifttailcc` calling convention, every continuation call is a guaranteed tail call (`return_call`), and the
+stack stays flat. The program must be linked against a Swift SDK whose libraries are built the same way, such as
+`swifthost-sdk-wasip1-threads-6.4.2-2` from this repository (artifact id `swift-6.4.2-RELEASE_wasm-threads-tailcall`,
+whose toolset adds the flag), and the runtime must support the WebAssembly tail-call proposal (WAMR: built with
+`WASM_ENABLE_TAIL_CALL=1`). Use `-Xcc -mtail-call` only with this compiler or later: `swifthost-6.4.2-2` and the
+swift.org 6.4.2 compiler do not use tail calls for async code even with the flag. Do not mix: code compiled without
+the flag links against that SDK, but calls into the runtime such as `withCheckedContinuation` trap, and deep chains of
+awaits still overflow the stack.
+
+Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
+and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
+
+## Changes in swifthost-6.4.2-3
+
+- WebAssembly tail calls for async code with `-Xcc -mtail-call` (see above): four upstream changes, three in
+  llvm-project and one in swift, plus the swift tests for them (see Source and patches). Nothing else changed:
+  swift-syntax, the API, `JOBS.txt` and the built-in macro module are the same as in `-2`.
+
 ## Changes in swifthost-6.4.2-2
 
 - Macros (see above): swift-syntax is linked in, `swifthost_set_plugin_message_handler()` is new, executable plugins
@@ -162,8 +188,8 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `876747e77e7e6f81855879912165c31484ef5c8d` |
-| [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `af10e9a7844d303de78404f574a453912edcee77` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `a76565c359a095385d56f2ecb80db9f72df043f0` |
+| [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
 | swiftlang/swift-syntax | tag `swift-6.4.2-RELEASE` | `050f1a346fbbac0ca2cfb15a95274f7bd1cf0ccf` |
@@ -189,6 +215,10 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   error instead of launched.
 - `[ASTGen]` diagnostic positions from a plugin that lie before the source buffer, and ranges that end before they
   start, are ignored instead of reaching the source manager.
+- `[IRGen]` (from `swifthost-6.4.2-3`) cherry-picks of swiftlang/swift `d7dcf221748` (tests for WebAssembly tail calls
+  in async code) and `3c9966afca9` (the `swift_task_switch` and `swift_asyncLet_finish` declarations carry the
+  `swiftasync` attribute of the runtime's definitions; without it, their WebAssembly signatures differ from the
+  runtime's when tail calls are enabled, and every call to them is invalid). Neither is in Swift 6.4.x.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
@@ -201,6 +231,15 @@ The llvm-project branch is `swift-6.4.2-RELEASE` plus:
   on a helper thread and reported as an ordinary error.
 - `[Support]` the crash recovery signal handlers are installed with `SA_ONSTACK`, so a thread with an alternate
   signal stack recovers from a stack overflow instead of dying.
+- `[WebAssembly]` (from `swifthost-6.4.2-3`) a cherry-pick of swiftlang/llvm-project `b9c55a400656`, "Wasm: support
+  tail calls in CallingConv::SwiftTail", which is not in Swift 6.4.x: with the `tail-call` target feature, clang
+  accepts `swiftasynccall` for WebAssembly, and the backend lowers `swifttailcc` `musttail` calls to `return_call`.
+- `[WebAssembly]` (from `swifthost-6.4.2-3`) a cherry-pick of llvm/llvm-project `fd9bc2e181b7`: a tail call in a
+  function with a stack protector is emitted after the guard check and after the stack pointer is restored. Before,
+  it was emitted ahead of both.
+- `[WebAssembly]` (from `swifthost-6.4.2-3`) a cherry-pick of llvm/llvm-project `38e6c0073c42`: a call with a `byval`
+  argument is never lowered as a tail call. Before, with tail calls enabled, the callee could get a pointer into the
+  caller's released stack frame (for example C++ thunks that forward `std::string_view` by value).
 
 ## Licenses
 
@@ -220,10 +259,10 @@ A published `swifthost-*` release is never changed: its assets are never replace
 
 On an Apple silicon Mac with Xcode 27.2, CMake and Ninja; about 3 GB for the sources and 1 GB per slice. `VERSION`
 is the release id: the slices compile it into the library (`swifthost_version()`), and `package` names the release
-after its argument, so pass the same id to both (`VERSION` defaults to `swifthost-6.4.2-2`, whatever you package):
+after its argument, so pass the same id to both (`VERSION` defaults to `swifthost-6.4.2-3`, whatever you package):
 
 ```sh
-export VERSION=swifthost-6.4.2-2             # the release id you are building
+export VERSION=swifthost-6.4.2-3             # the release id you are building
 swifthost/scripts/build.sh sources           # clones the pinned commits into ./src
 swifthost/scripts/build.sh native            # host llvm-tblgen and clang-tblgen
 swifthost/scripts/build.sh slice iphoneos
