@@ -11,6 +11,9 @@ upstream fixes (or fixes we intend to upstream), built from public forks under t
 - Linux toolchain tarballs and overlay tarballs are attached to each GitHub release.
 - `swifthost-<version>-<n>`: SwiftHostCompiler, the Swift compiler, clang and wasm-ld as an in-process static library
   (xcframework for iOS, the iOS simulator and macOS) that compiles Swift to WebAssembly; see [`swifthost/`](swifthost/README.md).
+- `swifthost-sdk-wasip1-threads-<version>-<n>`: a Swift SDK artifact bundle for `wasm32-unknown-wasip1-threads`, built from
+  the unmodified upstream release sources (upstream builds this target but does not package it); see
+  [`swifthost/wasm-threads-sdk/`](swifthost/wasm-threads-sdk/README.md).
 
 Every fix ships with a reproducer under `tests/` that must fail on the official release and pass on ours,
 on x86_64 and aarch64.
@@ -26,7 +29,8 @@ owner, date and reason). A pinned id keeps its GitHub release `swift-<id>`, the 
 limits: the releases-per-line limit and the mirror's newest 3 are computed over the unpinned releases, and the GHCR
 `keep-n-tagged` is raised by 2 tags per pin. Remove a pin in a commit as soon as its consumer has moved on.
 
-A `swifthost-<version>-<n>` line pins the GitHub release of that name (it is a release tag already and has no images).
+A `swifthost-<version>-<n>` or `swifthost-sdk-wasip1-threads-<version>-<n>` line pins the GitHub release of that name
+(it is a release tag already and has no images).
 swifthost releases are their own line per version (`swifthost-<version>`), so they never count against the toolchain
 releases, and vice versa.
 
