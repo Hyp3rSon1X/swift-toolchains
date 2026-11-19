@@ -95,6 +95,12 @@ them (for example as WebAssembly plugin modules in its own runtime) and answers 
 - `-in-process-plugin-server-path <library>`: a dynamic library that exports `swift_inproc_plugins_handle_message`,
   loaded by the library (macOS; not for App Store iOS apps).
 
+The release also carries `swift-builtin-macros-6.4.2-wasm32-wasip1.wasm`: the built-in macro plugins
+(ObservationMacros, SwiftMacros, TestingMacros, FoundationMacros) from the `swift-6.4.2-RELEASE` sources as one
+WebAssembly (WASI command) module using swift-syntax's wasm plugin ABI (`_start`, then `swift_wasm_macro_v1_pump`
+per message, 8-byte little-endian length framing on stdin/stdout); load the same file under each module name. Its
+recipe, test host and provenance are in `macros/` of the swift-toolchains repository.
+
 Each macro module is named with `-load-resolved-plugin <file>##<Module>`; the server gets the file's resolved path
 in `loadPluginLibrary`. See `JOBS.txt` for the arguments and message formats. A malformed or hostile reply is an
 error diagnostic for that macro (return value 1) and the library stays usable. Before the compiler parses a reply,
@@ -113,6 +119,8 @@ out: they fail with "executable plugins are not supported in this build", and no
 - The compiler's regex literal parser is built in (the build enables it only with swift-syntax; `-1` was built
   without it).
 - The library is about 27 MB larger per slice.
+- New release asset: the built-in macros as one wasm32-wasip1 module (above), with its own SHA-256 sums, provenance
+  and license files.
 
 ## Trimming the SDK
 
