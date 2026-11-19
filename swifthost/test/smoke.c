@@ -13,13 +13,23 @@
  *   helper-crash   a crash in a clang module build (on the compiler's helper
  *                  thread)
  *   xllvm-version  -Xllvm -version, which ends in LLVM's exit path with 0
+ *   deep-reply     a plugin reply of 4 Mi nested JSON arrays
+ * and these modes need a process of their own for other reasons:
+ *   plugin-handler macros through swifthost_set_plugin_message_handler (it is
+ *                  process-wide and can be set only once)
+ *   exec-plugin    every way to name an executable plugin; run-smoke.sh runs
+ *                  it with an interposer that aborts on any process creation
+ * Macros use test/plugin-server.c, built next to smoke as
+ * libswifthost-test-plugin-server.dylib and also linked into smoke itself.
  * Exit status 0 = all checks passed.
  */
 #include "SwiftHostCompiler.h"
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -37,7 +47,14 @@
 extern char **environ;
 
 static const char *SDK, *WORK, *IWASM, *TESTS;
-static char SW[4096], CACHE[4096];
+static char SW[4096], CACHE[4096], PLUGIN_SERVER[PATH_MAX];
+
+/* test/plugin-server.c, linked into smoke too (the handler of the
+   plugin-handler mode); the dynamic library has its own copy. */
+bool swift_inproc_plugins_handle_message(const char *message, size_t length, char **response,
+                                         size_t *responseLength);
+int swifthost_test_plugin_count(const char *kind);
+const char *swifthost_test_plugin_last_library(void);
 static int failures;
 
 #define CHECK(cond, ...)                                                       \
@@ -325,6 +342,112 @@ static char *writeFunctions(const char *name, int n) {
   return path;
 }
 
+/* A freestanding expression macro implemented by test/plugin-server.c. */
+static const char *MACRO_SOURCE =
+    "@freestanding(expression) macro answer() -> Int = "
+    "#externalMacro(module: \"M\", type: \"AnswerMacro\")\n"
+    "print(#answer)\n";
+static const char *MACRO_EXPECT = "42\n";
+
+/* The macro source file, and the (empty) library file that names module M:
+   the compiler only passes its resolved path to the plugin server. */
+static char *macroSource(void) {
+  char *src = fmt("%s/answer.swift", WORK);
+  writeFile(src, MACRO_SOURCE);
+  writeFile(fmt("%s/M.wasm", WORK), "");
+  return src;
+}
+
+/* Builds the macro source through the in-process plugin server at
+   serverPath; reply selects the server's reply to the expansion request. */
+static Build buildMacro(const char *tag, const char *serverPath, const char *reply) {
+  char *src = macroSource();
+  if (reply)
+    setenv("SWIFTHOST_TEST_PLUGIN_REPLY", reply, 1);
+  else
+    unsetenv("SWIFTHOST_TEST_PLUGIN_REPLY");
+  setenv("SWIFTHOST_TEST_PLUGIN_FILE", src, 1);
+  const char *extra[] = {"-in-process-plugin-server-path", serverPath, "-load-resolved-plugin",
+                         fmt("%s/M.wasm##M", WORK), NULL};
+  Build b = build(src, tag, extra);
+  unsetenv("SWIFTHOST_TEST_PLUGIN_REPLY");
+  return b;
+}
+
+typedef int (*CountFn)(const char *);
+
+/* The message counters of the plugin server library loaded by the compiler. */
+static CountFn serverCounter(void) {
+  void *h = dlopen(PLUGIN_SERVER, RTLD_LAZY | RTLD_NOLOAD);
+  return h ? (CountFn)dlsym(h, "swifthost_test_plugin_count") : NULL;
+}
+
+static void checkMacroBuild(const char *tag, Build *b, CountFn count) {
+  report(tag, b);
+  CHECK(b->rc == 0, "%s failed", tag);
+  CHECK(count != NULL, "%s: plugin server counters not found", tag);
+  if (count) {
+    printf("  plugin messages: getCapability %d, loadPluginLibrary %d, expandFreestandingMacro %d, "
+           "other %d\n", count("getCapability"), count("loadPluginLibrary"),
+           count("expandFreestandingMacro"), count("other"));
+    CHECK(count("getCapability") > 0, "%s: no getCapability message", tag);
+    CHECK(count("loadPluginLibrary") > 0, "%s: no loadPluginLibrary message", tag);
+    CHECK(count("expandFreestandingMacro") > 0, "%s: no expansion request", tag);
+    CHECK(count("other") == 0, "%s: unexpected plugin messages", tag);
+  }
+  if (!b->rc) {
+    char *out = runWasm(tag);
+    CHECK(!out || !strcmp(out, MACRO_EXPECT), "%s output %s", tag, out);
+  }
+}
+
+/* Malformed and hostile replies from the plugin server are macro errors: rc
+   1, a diagnostic, no poison. */
+static void checkBadReplies(void) {
+  static const struct {
+    const char *mode, *expect;
+  } cases[] = {
+      {"truncated", "(from macro 'answer')"},
+      {"garbage", "(from macro 'answer')"},
+      {"wrong-kind", "plugin returned invalid result"},
+      {"empty", "(from macro 'answer')"},
+      {"bad-positions", "hostile diagnostic"},
+      {"error", "failed to send request to plugin"},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+    char *tag = fmt("macro-reply-%s", cases[i].mode);
+    Build b = buildMacro(tag, PLUGIN_SERVER, cases[i].mode);
+    report(tag, &b);
+    CHECK(b.rc == 1 && b.stage == 1, "%s: rc %d stage %d", tag, b.rc, b.stage);
+    CHECK(b.diag && strstr(b.diag, cases[i].expect), "%s: diagnostics lack \"%s\": %s", tag,
+          cases[i].expect, b.diag ? b.diag : "(null)");
+  }
+}
+
+/* Executable plugins are rejected with a diagnostic and never launched. The
+   executable exists (/bin/true does not on macOS 27): the compiler resolves
+   the path before it gets to the plugin. */
+static void checkExecutablePlugins(void) {
+  char *src = macroSource();
+  char *dir = fmt("%s/external-plugins", WORK);
+  mkdir(dir, 0755);
+  writeFile(fmt("%s/libM.dylib", dir), "");
+  const char *extras[][3] = {
+      {"-load-plugin-executable", "/usr/bin/true#M", NULL},
+      {"-external-plugin-path", fmt("%s#/usr/bin/true", dir), NULL},
+      {"-load-resolved-plugin", fmt("%s/M.wasm#/usr/bin/true#M", WORK), NULL},
+  };
+  const char *tags[] = {"exec-plugin-executable", "exec-plugin-external-path",
+                        "exec-plugin-resolved"};
+  for (int i = 0; i < 3; ++i) {
+    Build b = build(src, tags[i], extras[i]);
+    report(tags[i], &b);
+    CHECK(b.rc == 1 && b.stage == 1, "%s: rc %d stage %d", tags[i], b.rc, b.stage);
+    CHECK(b.diag && strstr(b.diag, "executable plugins are not supported in this build"),
+          "%s: diagnostics: %s", tags[i], b.diag ? b.diag : "(null)");
+  }
+}
+
 static void *worker(void *unused) {
   (void)unused;
   SigSnap before, after;
@@ -382,12 +505,20 @@ static void *worker(void *unused) {
   CHECK(e.diag && strstr(e.diag, "error:") && strstr(e.diag, "bad.swift:1:"),
         "compile error diagnostics missing: %s", e.diag ? e.diag : "(null)");
 
-  /* Macros are not available (no plugin server): a clean error, no poison. */
+  /* A macro without a plugin server for its module: a clean error, no poison. */
   char *mac = fmt("%s/macro.swift", WORK);
   writeFile(mac, "import Observation\n@Observable final class M { var a = 1 }\nprint(M().a)\n");
   Build m = build(mac, "macro", NULL);
   report("macro", &m);
   CHECK(m.rc == 1 && m.stage == 1, "macro: rc %d stage %d", m.rc, m.stage);
+
+  /* Macros through the in-process plugin server library. */
+  Build md = buildMacro("macro-dylib", PLUGIN_SERVER, NULL);
+  checkMacroBuild("macro-dylib", &md, serverCounter());
+  checkBadReplies();
+  checkExecutablePlugins();
+  Build ma = buildMacro("macro-after-bad-replies", PLUGIN_SERVER, NULL);
+  checkMacroBuild("macro-after-bad-replies", &ma, serverCounter());
 
   /* A link error (missing library) is an ordinary failure too. */
   {
@@ -607,6 +738,73 @@ static void *xllvmVersionWorker(void *unused) {
   return NULL;
 }
 
+/* A reply nested deeper than the JSON scanner's recursion can go on the
+   calling thread's stack: a stack overflow, recovered, which poisons. */
+static void *deepReplyWorker(void *unused) {
+  (void)unused;
+  SigSnap before;
+  snap(&before);
+  installAltStack();
+  Build d = buildMacro("deep-reply", PLUGIN_SERVER, "deep");
+  report("deep-reply", &d);
+  CHECK(d.rc == 128 + SIGSEGV || d.rc == 128 + SIGBUS, "deep reply: rc %d (expected %d or %d)",
+        d.rc, 128 + SIGSEGV, 128 + SIGBUS);
+  checkAltStack("after the deep reply");
+  afterPoison("after-deep-reply", &before);
+  return NULL;
+}
+
+static int unexpectedHandlerCalls;
+static bool unexpectedHandler(const char *message, size_t length, char **response,
+                              size_t *responseLength) {
+  (void)message;
+  (void)length;
+  ++unexpectedHandlerCalls;
+  *response = strdup("this handler must never be used");
+  *responseLength = strlen(*response);
+  return true;
+}
+
+/* The app's own message handler: the server path does not exist and is never
+   opened. It is set once; later attempts change nothing. */
+static void *pluginHandlerWorker(void *unused) {
+  (void)unused;
+  SigSnap before, after;
+  snap(&before);
+  installAltStack();
+  swifthost_set_plugin_message_handler(swift_inproc_plugins_handle_message);
+  swifthost_set_plugin_message_handler(unexpectedHandler);
+  char *noServer = fmt("%s/no-such-dir/no-such-plugin-server.dylib", WORK);
+  Build b = buildMacro("macro-handler", noServer, NULL);
+  checkMacroBuild("macro-handler", &b, swifthost_test_plugin_count);
+  CHECK(strstr(swifthost_test_plugin_last_library(), "/M.wasm") != NULL,
+        "loadPluginLibrary path: %s", swifthost_test_plugin_last_library());
+  swifthost_set_plugin_message_handler(unexpectedHandler);
+  Build again = buildMacro("macro-handler-again", noServer, "wrong-kind");
+  report("macro-handler-again", &again);
+  CHECK(again.rc == 1 && again.diag && strstr(again.diag, "plugin returned invalid result"),
+        "macro-handler-again: rc %d: %s", again.rc, again.diag ? again.diag : "(null)");
+  Build last = buildMacro("macro-handler-last", noServer, NULL);
+  checkMacroBuild("macro-handler-last", &last, swifthost_test_plugin_count);
+  CHECK(unexpectedHandlerCalls == 0, "a second handler was used %d time(s)",
+        unexpectedHandlerCalls);
+  snap(&after);
+  snapDiff(&before, &after, "after the macro builds");
+  checkAltStack("after the macro builds");
+  return NULL;
+}
+
+static void *execPluginWorker(void *unused) {
+  (void)unused;
+  installAltStack();
+  checkExecutablePlugins();
+  /* The library is still healthy. */
+  Build h = build(fmt("%s/hello.swift", TESTS), "hello-after-exec-plugins", NULL);
+  report("hello-after-exec-plugins", &h);
+  CHECK(h.rc == 0, "build after the executable plugin attempts: rc %d", h.rc);
+  return NULL;
+}
+
 static int runMode(const char *mode) {
   void *(*fn)(void *) = NULL;
   size_t stackSize = SWIFTHOST_MIN_STACK_SIZE;
@@ -617,6 +815,12 @@ static int runMode(const char *mode) {
     fn = helperCrashWorker;
   } else if (!strcmp(mode, "xllvm-version")) {
     fn = xllvmVersionWorker;
+  } else if (!strcmp(mode, "deep-reply")) {
+    fn = deepReplyWorker;
+  } else if (!strcmp(mode, "plugin-handler")) {
+    fn = pluginHandlerWorker;
+  } else if (!strcmp(mode, "exec-plugin")) {
+    fn = execPluginWorker;
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
@@ -644,6 +848,13 @@ int main(int argc, char **argv) {
   TESTS = argv[4];
   snprintf(SW, sizeof SW, "%s/swift.xctoolchain/usr/lib/swift_static", SDK);
   snprintf(CACHE, sizeof CACHE, "%s/module-cache", WORK);
+  char self[PATH_MAX];
+  if (!realpath(argv[0], self)) {
+    perror(argv[0]);
+    return 2;
+  }
+  *strrchr(self, '/') = 0;
+  snprintf(PLUGIN_SERVER, sizeof PLUGIN_SERVER, "%s/libswifthost-test-plugin-server.dylib", self);
   mkdir(WORK, 0755);
   setvbuf(stdout, NULL, _IOLBF, 0);
   if (argc == 6)
