@@ -19,7 +19,11 @@
  *                  ranges lie before the source buffer or end before they
  *                  start (fileName from SWIFTHOST_TEST_PLUGIN_FILE)
  *   error          the handler reports an error instead of a reply
- *   deep           4 Mi nested JSON arrays
+ *   deep           200 Ki nested JSON arrays (enough to overflow a 16 MiB
+ *                  stack in the compiler's JSON scanner)
+ *   brackets       a valid reply whose expansion ("42" and a comment) holds
+ *                  1000 '[', '{', an escaped quote and an escaped backslash:
+ *                  brackets inside strings are not nesting
  */
 #include <stdbool.h>
 #include <stddef.h>
@@ -123,8 +127,22 @@ static bool expansionReply(char **response, size_t *responseLength) {
     *responseLength = strlen(text);
     return false;
   }
+  if (!strcmp(mode, "brackets")) {
+    char brackets[1001];
+    memset(brackets, '[', 1000);
+    brackets[1000] = 0;
+    char *text = NULL;
+    if (asprintf(&text,
+                 "{\"expandMacroResult\":{\"expandedSource\":\"42 /* %s {{ \\\" \\\\ */\","
+                 "\"diagnostics\":[]}}",
+                 brackets) < 0)
+      abort();
+    *response = text;
+    *responseLength = strlen(text);
+    return false;
+  }
   if (!strcmp(mode, "deep")) {
-    size_t n = 4u << 20;
+    size_t n = 200u << 10;
     char *buf = malloc(n);
     memset(buf, '[', n);
     *response = buf;

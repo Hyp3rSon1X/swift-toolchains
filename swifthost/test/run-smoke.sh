@@ -33,7 +33,7 @@ xcrun clang -target $TRIPLE -isysroot "$SYSROOT" -O1 -fvisibility=hidden -dynami
   -o "$WORK/libswifthost-test-plugin-server.dylib"
 xcrun clang -target $TRIPLE -isysroot "$SYSROOT" -O1 -dynamiclib "$HERE/nospawn.c" -o "$WORK/libnospawn.dylib"
 echo "smoke binary: $(stat -f %z "$WORK/smoke") bytes"
-MODES="overflow helper-crash xllvm-version deep-reply plugin-handler"
+MODES="overflow helper-crash xllvm-version plugin-handler"
 
 # exec-plugin's stderr (the interposer's log) must not show any process creation.
 check_nospawn() {
@@ -87,7 +87,7 @@ check_nospawn "$WORK/exec-plugin.stderr" || rc=1
 hello=$'hi'
 foundation='hi from Foundation 1970-01-01T00:00:00Z {"n":42} example.org'
 for w in "$WORK"/run/hello-onone-*.wasm "$WORK"/run/hello-after-errors.wasm "$WORK"/run/foundation-*.wasm \
-         "$WORK"/run/macro-dylib.wasm "$WORK"/run/macro-after-bad-replies.wasm "$WORK"/run-plugin-handler/macro-handler*.wasm; do
+         "$WORK"/run/macro-dylib.wasm "$WORK"/run/macro-reply-brackets.wasm "$WORK"/run/macro-after-bad-replies.wasm "$WORK"/run-plugin-handler/macro-handler*.wasm; do
   [[ -f $w ]] || continue
   out=$("$IWASM" "$w")
   case $(basename "$w") in hello*) want=$hello;; macro*) want=42;; *) want=$foundation;; esac

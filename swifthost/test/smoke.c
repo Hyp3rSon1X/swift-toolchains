@@ -13,7 +13,6 @@
  *   helper-crash   a crash in a clang module build (on the compiler's helper
  *                  thread)
  *   xllvm-version  -Xllvm -version, which ends in LLVM's exit path with 0
- *   deep-reply     a plugin reply of 4 Mi nested JSON arrays
  * and these modes need a process of their own for other reasons:
  *   plugin-handler macros through swifthost_set_plugin_message_handler (it is
  *                  process-wide and can be set only once)
@@ -359,7 +358,8 @@ static char *macroSource(void) {
 }
 
 /* Builds the macro source through the in-process plugin server at
-   serverPath; reply selects the server's reply to the expansion request. */
+   serverPath (NULL: no -in-process-plugin-server-path); reply selects the
+   server's reply to the expansion request. */
 static Build buildMacro(const char *tag, const char *serverPath, const char *reply) {
   char *src = macroSource();
   if (reply)
@@ -367,8 +367,10 @@ static Build buildMacro(const char *tag, const char *serverPath, const char *rep
   else
     unsetenv("SWIFTHOST_TEST_PLUGIN_REPLY");
   setenv("SWIFTHOST_TEST_PLUGIN_FILE", src, 1);
-  const char *extra[] = {"-in-process-plugin-server-path", serverPath, "-load-resolved-plugin",
-                         fmt("%s/M.wasm##M", WORK), NULL};
+  const char *extra[] = {"-load-resolved-plugin", fmt("%s/M.wasm##M", WORK),
+                         "-in-process-plugin-server-path", serverPath, NULL};
+  if (!serverPath)
+    extra[2] = NULL;
   Build b = build(src, tag, extra);
   unsetenv("SWIFTHOST_TEST_PLUGIN_REPLY");
   return b;
@@ -412,7 +414,10 @@ static void checkBadReplies(void) {
       {"wrong-kind", "plugin returned invalid result"},
       {"empty", "(from macro 'answer')"},
       {"bad-positions", "hostile diagnostic"},
+      /* The compiler drops the handler's error message. */
       {"error", "failed to send request to plugin"},
+      /* Rejected by the library before the compiler parses it. */
+      {"deep", "failed to send request to plugin"},
   };
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
     char *tag = fmt("macro-reply-%s", cases[i].mode);
@@ -516,6 +521,8 @@ static void *worker(void *unused) {
   Build md = buildMacro("macro-dylib", PLUGIN_SERVER, NULL);
   checkMacroBuild("macro-dylib", &md, serverCounter());
   checkBadReplies();
+  Build mb = buildMacro("macro-reply-brackets", PLUGIN_SERVER, "brackets");
+  checkMacroBuild("macro-reply-brackets", &mb, serverCounter());
   checkExecutablePlugins();
   Build ma = buildMacro("macro-after-bad-replies", PLUGIN_SERVER, NULL);
   checkMacroBuild("macro-after-bad-replies", &ma, serverCounter());
@@ -738,22 +745,6 @@ static void *xllvmVersionWorker(void *unused) {
   return NULL;
 }
 
-/* A reply nested deeper than the JSON scanner's recursion can go on the
-   calling thread's stack: a stack overflow, recovered, which poisons. */
-static void *deepReplyWorker(void *unused) {
-  (void)unused;
-  SigSnap before;
-  snap(&before);
-  installAltStack();
-  Build d = buildMacro("deep-reply", PLUGIN_SERVER, "deep");
-  report("deep-reply", &d);
-  CHECK(d.rc == 128 + SIGSEGV || d.rc == 128 + SIGBUS, "deep reply: rc %d (expected %d or %d)",
-        d.rc, 128 + SIGSEGV, 128 + SIGBUS);
-  checkAltStack("after the deep reply");
-  afterPoison("after-deep-reply", &before);
-  return NULL;
-}
-
 static int unexpectedHandlerCalls;
 static bool unexpectedHandler(const char *message, size_t length, char **response,
                               size_t *responseLength) {
@@ -784,6 +775,14 @@ static void *pluginHandlerWorker(void *unused) {
   report("macro-handler-again", &again);
   CHECK(again.rc == 1 && again.diag && strstr(again.diag, "plugin returned invalid result"),
         "macro-handler-again: rc %d: %s", again.rc, again.diag ? again.diag : "(null)");
+  /* -in-process-plugin-server-path is optional with a handler (the compiler
+     makes up a default path, which is never opened). */
+  Build noFlag = buildMacro("macro-handler-no-flag", NULL, NULL);
+  checkMacroBuild("macro-handler-no-flag", &noFlag, swifthost_test_plugin_count);
+  Build deep = buildMacro("macro-handler-deep", noServer, "deep");
+  report("macro-handler-deep", &deep);
+  CHECK(deep.rc == 1 && deep.diag && strstr(deep.diag, "failed to send request to plugin"),
+        "macro-handler-deep: rc %d: %s", deep.rc, deep.diag ? deep.diag : "(null)");
   Build last = buildMacro("macro-handler-last", noServer, NULL);
   checkMacroBuild("macro-handler-last", &last, swifthost_test_plugin_count);
   CHECK(unexpectedHandlerCalls == 0, "a second handler was used %d time(s)",
@@ -815,8 +814,6 @@ static int runMode(const char *mode) {
     fn = helperCrashWorker;
   } else if (!strcmp(mode, "xllvm-version")) {
     fn = xllvmVersionWorker;
-  } else if (!strcmp(mode, "deep-reply")) {
-    fn = deepReplyWorker;
   } else if (!strcmp(mode, "plugin-handler")) {
     fn = pluginHandlerWorker;
   } else if (!strcmp(mode, "exec-plugin")) {
