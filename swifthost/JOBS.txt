@@ -8,8 +8,8 @@ swift-6.4.2-RELEASE_wasm
 
 These are the jobs `swiftc -target wasm32-unknown-wasip1 -static-stdlib` runs
 with that SDK, minus the out-of-process pieces (driver, clang link driver,
-macro plugin server). Every argument goes in its own argv element; nothing is
-shell-expanded.
+macro plugin server processes). Every argument goes in its own argv element;
+nothing is shell-expanded.
 
 Placeholders
 ------------
@@ -58,12 +58,43 @@ All sources go into one call and one object (whole-module mode, which
 Optional: `-g` for DWARF in the object (wasm-ld keeps it in custom sections);
 `-swift-version 5` or `-swift-version 6` (the default is 5, as with swiftc);
 `-parse-as-library` when the code has an `@main` type instead of top-level
-code.
+code; `-diagnostic-style llvm` for one-line diagnostics as in
+swifthost-6.4.2-1 (the default style now prints source excerpts under each
+`file:line:column: error: ...` line).
 
-Not available: macros (#Predicate, @Observable, #expect, ...). They need the
-out-of-process macro plugin server and plugin dylibs, which this library does
-not include; using one fails with "external macro implementation ... could not
-be found".
+Macros (#Predicate, @Observable, #expect, your own): the compiler expands them
+by sending JSON messages to an in-process plugin server, which the app
+provides; the library contains no macro implementations. Add, per call:
+
+  -in-process-plugin-server-path $SERVER
+  -load-resolved-plugin $LIB##$MODULE
+
+  $SERVER  either a dynamic library that exports
+           swift_inproc_plugins_handle_message (the compiler loads it), or,
+           after swifthost_set_plugin_message_handler(), any path: it then
+           only selects the in-process route, the app's handler answers the
+           messages, and nothing is loaded
+  $LIB     an existing file that holds the macro implementations of module
+           $MODULE, for example a WebAssembly plugin module the app runs
+           itself; the compiler passes its resolved path to the server in the
+           loadPluginLibrary message and never opens it
+  $MODULE  the module named in #externalMacro(module:type:), e.g.
+           ObservationMacros; several modules: $LIB##A,B, or one
+           -load-resolved-plugin per library
+
+The server must answer getCapability with protocol version 8 and the feature
+"load-plugin-library", loadPluginLibrary, and the expansion requests
+(expandFreestandingMacro, expandAttachedMacro); the message formats are those
+of swift-syntax 6.4.2 (Sources/SwiftCompilerPluginMessageHandling/
+PluginMessages.swift). A macro whose module has no -load-resolved-plugin fails
+with "external macro implementation type ... could not be found ...; plugin
+for module ... not found"; a malformed reply fails that macro with an error
+diagnostic (rc 1), except a reply nested so deeply that the JSON parser
+overflows the calling thread's stack (millions of levels), which poisons the
+library like a compiler crash. Executable plugins are not supported: -load-plugin-executable,
+-external-plugin-path and the server part of -load-resolved-plugin
+($LIB#$EXECUTABLE#$MODULE) fail with "executable plugins are not supported in
+this build" and never start a process.
 
 Step 2: extract autolink entries (swifthost_swift_autolink_extract)
 -------------------------------------------------------------------

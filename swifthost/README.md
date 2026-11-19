@@ -2,14 +2,14 @@
 
 The Swift 6.4.2 compiler, clang and wasm-ld as a static library for iOS, the iOS simulator and macOS (arm64,
 deployment target 27.0). An app links it and compiles Swift source to WebAssembly (wasm32-unknown-wasip1) in its
-own process: no subprocesses, no JIT, no dynamic loading. The output runs in any WASI preview 1 runtime, for example
-WAMR in interpreter mode.
+own process: no subprocesses, no JIT, and no dynamic loading unless the app names a plugin server library. The output
+runs in any WASI preview 1 runtime, for example WAMR in interpreter mode.
 
 It compiles against the official swift.org Swift SDK for WebAssembly, `swift-6.4.2-RELEASE_wasm`
 (artifactbundle SHA-256 `83baca83553f8c443cda7b84800912e6e709c3acd2e7ebf277794ca5836c0da5`), which the app ships
 or downloads itself. Programs can use the standard library, Foundation (FoundationEssentials,
 FoundationInternationalization), Observation's runtime, Synchronization, RegexBuilder and the other modules in that
-SDK. Macros are not available (see Limits).
+SDK. Macros work through an in-process plugin server that the app provides (see Macros).
 
 ## Contents
 
@@ -27,7 +27,7 @@ SDK. Macros are not available (see Limits).
 
 Each `libSwiftHostCompiler.a` holds one prelinked object: the compiler, clang (as the Swift compiler's C importer),
 LLVM with only the WebAssembly backend, and lld's wasm linker, linked together (`ld -r`) and with every symbol
-hidden except the five `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
+hidden except the six `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
 cannot clash with it.
 
 ## Linking
@@ -45,9 +45,9 @@ object carries `LC_LINKER_OPTION`s for everything else it needs, so no other set
   no symbols from them are used.
 - No zlib, zstd, libxml2 or curl.
 
-Size: each `libSwiftHostCompiler.a` is about 182 MB. Linked into an app with dead stripping and with symbols stripped
-(Xcode's default for release builds), it adds about 100 MB to the executable: `__TEXT` 97 MB, `__DATA_CONST` 2.7 MB,
-`__DATA` 1.2 MB, nearly the same for all three slices.
+Size: each `libSwiftHostCompiler.a` is about 209 MB (182 MB in `swifthost-6.4.2-1`, before swift-syntax was added for
+macros). Linked into the macOS smoke test with dead stripping, it adds about 110 MB to the executable: `__TEXT`
+104 MB, `__DATA_CONST` 3.0 MB, `__DATA` 2.2 MB.
 
 ## Using it
 
@@ -62,6 +62,27 @@ See `SwiftHostCompiler.h` for the contract and `JOBS.txt` for the jobs. In short
    one): tell the user to restart the app before compiling again.
 5. To stop a compile, call `swifthost_request_cancel()` from another thread; the frontend call returns
    `SWIFTHOST_ECANCELED` (124) and the library stays usable.
+
+## Macros
+
+The compiler includes swift-syntax and expands macros like `swiftc` does with an in-process plugin server: it sends
+each request (`getCapability`, `loadPluginLibrary`, `expandFreestandingMacro`, `expandAttachedMacro`) as a JSON
+message to a function and gets the reply back from it. The library contains no macro implementations; the app runs
+them (for example as WebAssembly plugin modules in its own runtime) and answers the messages. Two ways:
+
+- `swifthost_set_plugin_message_handler(handler)`, once, before the first compile: the app's own function receives
+  every message (same contract as `swift_inproc_plugins_handle_message`; the reply is a `malloc`ed buffer that the
+  compiler frees). Frontend calls still pass `-in-process-plugin-server-path <any path>`, which selects the route;
+  the path is never opened.
+- `-in-process-plugin-server-path <library>`: a dynamic library that exports `swift_inproc_plugins_handle_message`,
+  loaded by the compiler (macOS; not for App Store iOS apps).
+
+Each macro module is named with `-load-resolved-plugin <file>##<Module>`; the server gets the file's resolved path
+in `loadPluginLibrary`. See `JOBS.txt` for the arguments and message formats. A malformed or hostile reply is an
+error diagnostic for that macro (return value 1); a reply nested so deeply that the JSON parser overflows the
+calling thread's stack is recovered like a compiler crash. Executable plugins (`-load-plugin-executable`,
+`-external-plugin-path`) are compiled out: they fail with "executable plugins are not supported in this build",
+and no process is started.
 
 Measured with `test/smoke.c` on macOS on a Mac mini (Apple M4) shared with other builds:
 
@@ -101,8 +122,8 @@ Synchronization, ...) needs that module's `.swiftmodule` directory and its `lib*
 ## Limits
 
 - One call at a time per process (calls are serialized internally).
-- No macros (`@Observable`, `#Predicate`, `#expect`, ...): they need swift-syntax and macro plugins, which are not
-  included. Using one is an ordinary compile error (return value 1), for example:
+- No macro implementations are included (`@Observable`, `#Predicate`, `#expect`, ...): the app serves them (see
+  Macros). A macro whose module no plugin serves is an ordinary compile error (return value 1), for example:
   `error: external macro implementation type 'ObservationMacros.ObservableMacro' could not be found for macro
   'Observable()'; plugin for module 'ObservationMacros' not found`.
 - After a compiler crash the library refuses further work until the process restarts (the crash recovery skips
@@ -122,10 +143,11 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `8e7c4d1b6a1c826e7abe3246721f6291a5f17159` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `320cb47426b5cfeb59909deb4b3eb0453a9bdc43` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `af10e9a7844d303de78404f574a453912edcee77` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
+| swiftlang/swift-syntax | tag `swift-6.4.2-RELEASE` | `050f1a346fbbac0ca2cfb15a95274f7bd1cf0ccf` |
 
 The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.2-hyp3r.7` in this repository
 (see `releases/6.4.2-hyp3r.7.env`), plus these changes for running in-process:
@@ -140,6 +162,14 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   macro and debugger testing transforms crashed on the unchecked code), and the frontend skips the work after
   semantic analysis; before, a cancelled compile finished type checking every top-level statement and function
   body first.
+- `[CMake]` `SWIFT_COMPILER_SWIFT_SYNTAX_STATIC` (default off): the compiler's swift-syntax libraries as static
+  libraries, so they are linked into the prelinked object.
+- `[AST]` `InProcessPlugins::setHandleMessageOverride()`: a process-wide handler that replaces the in-process plugin
+  server library (behind `swifthost_set_plugin_message_handler`).
+- `[AST]` `SWIFT_DISABLE_EXECUTABLE_PLUGINS` (CMake option, default off): executable plugins are rejected with an
+  error instead of launched.
+- `[ASTGen]` diagnostic positions from a plugin that lie before the source buffer, and ranges that end before they
+  start, are ignored instead of reaching the source manager.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
@@ -157,8 +187,8 @@ The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
 LLVM, clang and lld: Apache License 2.0 with LLVM Exceptions (`licenses/llvm-LICENSE.TXT`, `clang-LICENSE.TXT`,
 `lld-LICENSE.TXT`), with BLAKE3 (`llvm-Support-BLAKE3-LICENSE`) and the regex code (`llvm-Support-COPYRIGHT.regex`)
-in LLVM's Support library. Swift and swift-experimental-string-processing: Apache License 2.0 with the Runtime
-Library Exception (`swift-LICENSE.txt`). swift-cmark: `swift-cmark-COPYING`. Files with their own notices carry them
+in LLVM's Support library. Swift, swift-syntax and swift-experimental-string-processing: Apache License 2.0 with
+the Runtime Library Exception (`swift-LICENSE.txt`, `swift-syntax-LICENSE.txt`). swift-cmark: `swift-cmark-COPYING`. Files with their own notices carry them
 in their headers at the commits above.
 
 ## Release policy
@@ -171,10 +201,10 @@ A published `swifthost-*` release is never changed: its assets are never replace
 
 On an Apple silicon Mac with Xcode 27.2, CMake and Ninja; about 3 GB for the sources and 1 GB per slice. `VERSION`
 is the release id: the slices compile it into the library (`swifthost_version()`), and `package` names the release
-after its argument, so pass the same id to both (`VERSION` defaults to `swifthost-6.4.2-1`, whatever you package):
+after its argument, so pass the same id to both (`VERSION` defaults to `swifthost-6.4.2-2`, whatever you package):
 
 ```sh
-export VERSION=swifthost-6.4.2-1             # the release id you are building
+export VERSION=swifthost-6.4.2-2             # the release id you are building
 swifthost/scripts/build.sh sources           # clones the pinned commits into ./src
 swifthost/scripts/build.sh native            # host llvm-tblgen and clang-tblgen
 swifthost/scripts/build.sh slice iphoneos
