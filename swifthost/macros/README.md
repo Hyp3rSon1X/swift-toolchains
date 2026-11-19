@@ -35,9 +35,10 @@ module names. The libraries' own `@main` files (TestingMacrosMain.swift, Foundat
 
 ## Build
 
-`build.sh [WORKDIR]` (default `build/swifthost-macros`): needs `src/{swift-syntax,swift-testing,swift-foundation}`
+`build.sh [WORKDIR]` (default `./build`): needs `src/{swift-syntax,swift-testing,swift-foundation}`
 and a sparse `src/swift` (`lib/Macros`, `LICENSE.txt`), all at swift-6.4.2-RELEASE, the swift.org
-`swift-6.4.2-RELEASE_wasm` SDK bundle, the hyp3r.9 toolchain and `build-slot`. It symlinks the library sources
+`swift-6.4.2-RELEASE_wasm` SDK bundle (`SDKBUNDLE`) and the swift-6.4.2-hyp3r.9 toolchain (`TC`); `WRAP` optionally
+prefixes the heavy build command. It symlinks the library sources
 into `pkg/Sources`, then runs `swift build --swift-sdks-path ... --swift-sdk swift-6.4.2-RELEASE_wasm -c release
 -Xlinker --strip-all`. `package-dist.sh` adds licenses, `macros-provenance.json`, `macros-SHA256SUMS`.
 `tools/wasm-inspect.py` lists sections/imports/exports without wabt.

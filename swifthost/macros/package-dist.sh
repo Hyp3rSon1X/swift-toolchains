@@ -3,9 +3,9 @@
 # Usage: package-dist.sh [WORKDIR]
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-W=${1:-/Volumes/MEA-SSD/Hyp3rSuite/SwiftCollection/build/swifthost-macros}
+W=${1:-$PWD/build}
 TCROOT=${TCROOT:-$HOME/Library/Developer/Toolchains/swift-6.4.2-hyp3r.9.xctoolchain}
-SDKBUNDLE=${SDKBUNDLE:-/Volumes/MEA-SSD/Hyp3rSuite/SwiftCollection/build/swifthost/sdk/swift-6.4.2-RELEASE_wasm.artifactbundle}
+SDKBUNDLE=${SDKBUNDLE:?set SDKBUNDLE to the unpacked swift-6.4.2-RELEASE_wasm.artifactbundle}
 SDKTGZ_SHA=83baca83553f8c443cda7b84800912e6e709c3acd2e7ebf277794ca5836c0da5
 D=$W/dist; WASM=swift-builtin-macros-6.4.2-wasm32-wasip1.wasm
 cp "$W/src/swift-syntax/LICENSE.txt" "$D/LICENSE-swift-syntax.txt"
