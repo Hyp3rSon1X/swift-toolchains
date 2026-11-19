@@ -68,10 +68,15 @@
  * - Macros: the compiler sends macro expansion requests as JSON messages to an
  *   in-process plugin server, which is either a dynamic library that exports
  *   swift_inproc_plugins_handle_message (-in-process-plugin-server-path) or
- *   the app's own handler (swifthost_set_plugin_message_handler). Executable
- *   plugins (-load-plugin-executable, -external-plugin-path, the server part
- *   of -load-resolved-plugin) are rejected with an error diagnostic; they are
- *   never launched.
+ *   the app's own handler (swifthost_set_plugin_message_handler). Either
+ *   way the library checks each reply before the compiler parses it: one
+ *   that nests arrays or objects more than 512 levels deep is turned into an
+ *   error for that macro. Executable plugins (-load-plugin-executable,
+ *   -external-plugin-path, the server part of -load-resolved-plugin) are
+ *   rejected with an error diagnostic; they are never launched.
+ * - Diagnostics use swift-syntax's style, which prints source excerpts under
+ *   each "file:line:column: error: ..." line; -diagnostic-style llvm gives
+ *   one-line diagnostics as in swifthost-6.4.2-1.
  */
 #ifndef SWIFTHOSTCOMPILER_H
 #define SWIFTHOSTCOMPILER_H
@@ -131,11 +136,16 @@ void swifthost_request_cancel(void);
    swift_inproc_plugins_handle_message entry point of an in-process plugin
    server library. message/length: the request (JSON, not NUL-terminated,
    valid only during the call). Store a buffer allocated with malloc() in
-   *response and its size in *response_length; the compiler releases it with
-   free(). Return false with the reply message, or true with an error message
-   (the compiler reports it for the macro). Called on the thread running the
-   swifthost_swift_frontend call, inside that call; it must not call into this
-   library. */
+   *response and its size in *response_length (exactly the reply's size);
+   the compiler releases it with free(). Return false with the reply message,
+   or true with an error message in the buffer: the compiler then fails the
+   macro with "failed to send request to plugin" and does not show the
+   message. Called during a swifthost_swift_frontend call, usually on the
+   calling thread, but also on the compiler's 8 MiB helper thread when the
+   call rebuilds a module from its .swiftinterface (that build gets the
+   call's plugin options). A crash in the handler is recovered like a compiler
+   crash on the calling thread (it poisons the library) and ends the process
+   on the helper thread. It must not call into this library. */
 typedef bool (*swifthost_plugin_message_handler)(const char *message,
                                                  size_t length,
                                                  char **response,
@@ -145,17 +155,15 @@ typedef bool (*swifthost_plugin_message_handler)(const char *message,
    an in-process plugin server library. Call it once, before the first
    swifthost_swift_frontend call: a later call, a second call or a NULL
    handler does nothing. The handler is process-wide and stays set.
-   Frontend calls still select the in-process route with
-   -in-process-plugin-server-path <path>; with a handler set, <path> is only
-   an identifier (it is never opened and need not exist). Macro modules are
-   named with -load-resolved-plugin <library>##<Module>: the handler receives
-   <library> (an existing file; the compiler resolves symbolic links) in the
+   -in-process-plugin-server-path is optional with a handler: a path given
+   there is never opened and need not exist (without it the compiler makes
+   up a default path, also never opened). Macro modules are named with
+   -load-resolved-plugin <library>##<Module>: the handler receives <library>
+   (an existing file; the compiler resolves symbolic links) in the
    loadPluginLibrary message. A malformed reply (not JSON, truncated, empty,
-   the wrong message kind, positions outside the source) fails that macro
-   with an error diagnostic (return value 1). A crash in the handler, and a
-   reply nested so deeply that the compiler's JSON parser overflows the
-   calling thread's stack, are recovered like a compiler crash: they poison
-   the library. The reply's length must be the size of the buffer. */
+   the wrong message kind, nested more than 512 levels deep, positions
+   outside the source) fails that macro with an error diagnostic (return
+   value 1); the library stays usable. */
 void swifthost_set_plugin_message_handler(
     swifthost_plugin_message_handler handler);
 

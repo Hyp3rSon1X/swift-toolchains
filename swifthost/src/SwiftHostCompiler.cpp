@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -43,14 +44,122 @@ std::once_flag gInitOnce;
 std::mutex gCancelLock;
 std::shared_ptr<std::atomic<bool>> gCancelFlag;
 
-// The plugin message handler can be set until the first frontend call starts;
-// after that the compiler may already be using the in-process plugin route.
+// Macro plugin messages. Every reply passes through handlePluginMessage,
+// which bounds its nesting depth: swift-syntax's JSON scanner recurses once
+// per array or object level (about 160 bytes of stack each), so a reply of
+// some 100,000 '[' would overflow the calling thread's stack, and a helper
+// thread's (module interface builds) is not recoverable at all.
+using MessageHandler = swift::InProcessPlugins::HandleMessageFunction;
+
+// The app's handler. It can be set until the first frontend call starts.
 std::mutex gPluginHandlerLock;
 bool gPluginHandlerFrozen = false;
+std::atomic<MessageHandler> gAppHandler{nullptr};
+
+// Without an app handler: the entry point of the plugin server library that
+// the running frontend call names (-in-process-plugin-server-path).
+std::atomic<MessageHandler> gServerHandler{nullptr};
+
+constexpr size_t kMaxReplyDepth = 512;
 
 void freezePluginHandler() {
   std::lock_guard<std::mutex> lock(gPluginHandlerLock);
   gPluginHandlerFrozen = true;
+}
+
+// Whether the arrays and objects of a JSON text nest deeper than limit
+// (brackets inside strings do not count).
+bool nestsDeeperThan(const char *text, size_t length, size_t limit) {
+  size_t depth = 0;
+  bool inString = false;
+  for (size_t i = 0; i < length; ++i) {
+    char c = text[i];
+    if (inString) {
+      if (c == '\\')
+        ++i;
+      else if (c == '"')
+        inString = false;
+    } else if (c == '"') {
+      inString = true;
+    } else if (c == '[' || c == '{') {
+      if (++depth > limit)
+        return true;
+    } else if ((c == ']' || c == '}') && depth > 0) {
+      --depth;
+    }
+  }
+  return false;
+}
+
+bool handlerError(char **response, size_t *responseLength, const char *message) {
+  size_t n = std::strlen(message);
+  char *buffer = static_cast<char *>(std::malloc(n));
+  if (buffer)
+    std::memcpy(buffer, message, n);
+  *response = buffer;
+  *responseLength = buffer ? n : 0;
+  return true;
+}
+
+bool handlePluginMessage(const char *message, size_t length, char **response,
+                         size_t *responseLength) {
+  MessageHandler handler = gAppHandler.load(std::memory_order_acquire);
+  if (!handler)
+    handler = gServerHandler.load(std::memory_order_acquire);
+  if (!handler)
+    return handlerError(response, responseLength, "no in-process plugin server");
+  char *reply = nullptr;
+  size_t replyLength = 0;
+  bool hadError = handler(message, length, &reply, &replyLength);
+  if (!hadError && reply && nestsDeeperThan(reply, replyLength, kMaxReplyDepth)) {
+    std::free(reply);
+    return handlerError(response, responseLength,
+                        "plugin reply nests arrays or objects too deeply");
+  }
+  *response = reply;
+  *responseLength = replyLength;
+  return hadError;
+}
+
+// The entry point of a plugin server library, or null if it cannot be loaded
+// (the compiler then tries itself and reports the error). Libraries stay
+// loaded, as they do when the compiler loads them.
+MessageHandler loadPluginServer(const char *path) {
+  static std::mutex lock;
+  static std::string lastPath;
+  static MessageHandler lastHandler = nullptr;
+  std::lock_guard<std::mutex> guard(lock);
+  if (lastHandler && lastPath == path)
+    return lastHandler;
+  void *library = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+  if (!library)
+    return nullptr;
+  auto handler = reinterpret_cast<MessageHandler>(
+      dlsym(library, "swift_inproc_plugins_handle_message"));
+  if (handler) {
+    lastPath = path;
+    lastHandler = handler;
+  }
+  return handler;
+}
+
+// Routes the plugin messages of the frontend call with these arguments
+// through handlePluginMessage: to the app's handler, or else to the server
+// library the arguments name. With neither, the compiler's own route stays.
+void configurePluginRoute(int argc, const char **argv) {
+  MessageHandler server = nullptr;
+  if (!gAppHandler.load(std::memory_order_acquire)) {
+    const char *path = nullptr; // the last one counts, as in the compiler
+    for (int i = 1; i + 1 < argc; ++i)
+      if (argv[i] && !std::strcmp(argv[i], "-in-process-plugin-server-path"))
+        path = argv[i + 1];
+    if (path)
+      server = loadPluginServer(path);
+  }
+  gServerHandler.store(server, std::memory_order_release);
+  bool routed = server || gAppHandler.load(std::memory_order_acquire);
+  swift::InProcessPlugins::setHandleMessageOverride(routed ? handlePluginMessage
+                                                           : nullptr);
 }
 
 // Hands the call's flag to the compiler. The type checker's constraint solver
@@ -230,7 +339,7 @@ swifthost_set_plugin_message_handler(swifthost_plugin_message_handler handler) {
   std::lock_guard<std::mutex> lock(gPluginHandlerLock);
   if (gPluginHandlerFrozen || !handler)
     return;
-  swift::InProcessPlugins::setHandleMessageOverride(handler);
+  gAppHandler.store(handler, std::memory_order_release);
   gPluginHandlerFrozen = true;
 }
 
@@ -241,6 +350,7 @@ extern "C" int swifthost_swift_frontend(int argc, const char **argv,
     return 2;
   freezePluginHandler();
   return runGuarded(err_fd, [&](bool &poison) {
+    configurePluginRoute(argc, argv);
     FdStream diagOS(err_fd, /*unbuffered=*/true);
     auto flag = std::make_shared<std::atomic<bool>>(false);
     {
