@@ -63,27 +63,6 @@ See `SwiftHostCompiler.h` for the contract and `JOBS.txt` for the jobs. In short
 5. To stop a compile, call `swifthost_request_cancel()` from another thread; the frontend call returns
    `SWIFTHOST_ECANCELED` (124) and the library stays usable.
 
-## Macros
-
-The compiler includes swift-syntax and expands macros like `swiftc` does with an in-process plugin server: it sends
-each request (`getCapability`, `loadPluginLibrary`, `expandFreestandingMacro`, `expandAttachedMacro`) as a JSON
-message to a function and gets the reply back from it. The library contains no macro implementations; the app runs
-them (for example as WebAssembly plugin modules in its own runtime) and answers the messages. Two ways:
-
-- `swifthost_set_plugin_message_handler(handler)`, once, before the first compile: the app's own function receives
-  every message (same contract as `swift_inproc_plugins_handle_message`; the reply is a `malloc`ed buffer that the
-  compiler frees). Frontend calls still pass `-in-process-plugin-server-path <any path>`, which selects the route;
-  the path is never opened.
-- `-in-process-plugin-server-path <library>`: a dynamic library that exports `swift_inproc_plugins_handle_message`,
-  loaded by the compiler (macOS; not for App Store iOS apps).
-
-Each macro module is named with `-load-resolved-plugin <file>##<Module>`; the server gets the file's resolved path
-in `loadPluginLibrary`. See `JOBS.txt` for the arguments and message formats. A malformed or hostile reply is an
-error diagnostic for that macro (return value 1); a reply nested so deeply that the JSON parser overflows the
-calling thread's stack is recovered like a compiler crash. Executable plugins (`-load-plugin-executable`,
-`-external-plugin-path`) are compiled out: they fail with "executable plugins are not supported in this build",
-and no process is started.
-
 Measured with `test/smoke.c` on macOS on a Mac mini (Apple M4) shared with other builds:
 
 | | first build (empty module cache) | later builds |
@@ -102,6 +81,38 @@ In the iOS 27.2 simulator on the same Mac, in two runs while other builds were u
 slower (hello world 1.3-9 s for the first build and 0.03-0.6 s later, Foundation frontend 0.8-8.8 s, wasm-ld 0.6-7.4 s,
 cancel within 0.08-1.4 s; peak memory about the same). We did not find out why; processes started with `simctl spawn`
 may run at a low scheduling priority. Measure on a device.
+
+## Macros
+
+The compiler includes swift-syntax and expands macros like `swiftc` does with an in-process plugin server: it sends
+each request (`getCapability`, `loadPluginLibrary`, `expandFreestandingMacro`, `expandAttachedMacro`) as a JSON
+message to a function and gets the reply back from it. The library contains no macro implementations; the app runs
+them (for example as WebAssembly plugin modules in its own runtime) and answers the messages. Two ways:
+
+- `swifthost_set_plugin_message_handler(handler)`, once, before the first compile: the app's own function receives
+  every message (same contract as `swift_inproc_plugins_handle_message`; the reply is a `malloc`ed buffer that the
+  compiler frees). `-in-process-plugin-server-path` is then optional; a path given there is never opened.
+- `-in-process-plugin-server-path <library>`: a dynamic library that exports `swift_inproc_plugins_handle_message`,
+  loaded by the library (macOS; not for App Store iOS apps).
+
+Each macro module is named with `-load-resolved-plugin <file>##<Module>`; the server gets the file's resolved path
+in `loadPluginLibrary`. See `JOBS.txt` for the arguments and message formats. A malformed or hostile reply is an
+error diagnostic for that macro (return value 1) and the library stays usable. Before the compiler parses a reply,
+the library rejects one that nests arrays or objects more than 512 levels deep (swift-syntax's JSON parser recurses
+once per level and would overflow the stack at around 100,000). The handler usually runs on the calling thread, but
+also on the compiler's 8 MiB helper thread when a module is rebuilt from its `.swiftinterface`; a crash in the
+handler there ends the process. Executable plugins (`-load-plugin-executable`, `-external-plugin-path`) are compiled
+out: they fail with "executable plugins are not supported in this build", and no process is started.
+
+## Changes in swifthost-6.4.2-2
+
+- Macros (see above): swift-syntax is linked in, `swifthost_set_plugin_message_handler()` is new, executable plugins
+  are rejected.
+- Diagnostics use swift-syntax's style, which prints source excerpts under each `file:line:column: error: ...` line;
+  `-diagnostic-style llvm` gives the one-line diagnostics of `-1`.
+- The compiler's regex literal parser is built in (the build enables it only with swift-syntax; `-1` was built
+  without it).
+- The library is about 27 MB larger per slice.
 
 ## Trimming the SDK
 
@@ -143,7 +154,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `320cb47426b5cfeb59909deb4b3eb0453a9bdc43` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `876747e77e7e6f81855879912165c31484ef5c8d` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `af10e9a7844d303de78404f574a453912edcee77` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |

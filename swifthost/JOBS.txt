@@ -69,11 +69,11 @@ provides; the library contains no macro implementations. Add, per call:
   -in-process-plugin-server-path $SERVER
   -load-resolved-plugin $LIB##$MODULE
 
-  $SERVER  either a dynamic library that exports
-           swift_inproc_plugins_handle_message (the compiler loads it), or,
-           after swifthost_set_plugin_message_handler(), any path: it then
-           only selects the in-process route, the app's handler answers the
-           messages, and nothing is loaded
+  $SERVER  a dynamic library that exports swift_inproc_plugins_handle_message
+           (the library loads it). After swifthost_set_plugin_message_handler()
+           the app's handler answers the messages instead and nothing is
+           loaded; the flag is then optional and its path, if given, is never
+           opened
   $LIB     an existing file that holds the macro implementations of module
            $MODULE, for example a WebAssembly plugin module the app runs
            itself; the compiler passes its resolved path to the server in the
@@ -89,9 +89,11 @@ of swift-syntax 6.4.2 (Sources/SwiftCompilerPluginMessageHandling/
 PluginMessages.swift). A macro whose module has no -load-resolved-plugin fails
 with "external macro implementation type ... could not be found ...; plugin
 for module ... not found"; a malformed reply fails that macro with an error
-diagnostic (rc 1), except a reply nested so deeply that the JSON parser
-overflows the calling thread's stack (millions of levels), which poisons the
-library like a compiler crash. Executable plugins are not supported: -load-plugin-executable,
+diagnostic (rc 1) and the library stays usable. The library rejects replies
+that nest arrays or objects more than 512 levels deep before the compiler
+parses them (its JSON parser recurses once per level), and replies for which
+the handler returns an error; both show up as "failed to send request to
+plugin". Executable plugins are not supported: -load-plugin-executable,
 -external-plugin-path and the server part of -load-resolved-plugin
 ($LIB#$EXECUTABLE#$MODULE) fail with "executable plugins are not supported in
 this build" and never start a process.
