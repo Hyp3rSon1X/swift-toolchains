@@ -4,6 +4,7 @@
 #include "SwiftHostCompiler.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/PluginRegistry.h"
 #include "swift/Basic/InitializeSwiftModules.h"
 #include "swift/Basic/Version.h"
 #include "swift/Frontend/Frontend.h"
@@ -41,6 +42,16 @@ std::once_flag gInitOnce;
 // runs, so a request can never leak into a later call.
 std::mutex gCancelLock;
 std::shared_ptr<std::atomic<bool>> gCancelFlag;
+
+// The plugin message handler can be set until the first frontend call starts;
+// after that the compiler may already be using the in-process plugin route.
+std::mutex gPluginHandlerLock;
+bool gPluginHandlerFrozen = false;
+
+void freezePluginHandler() {
+  std::lock_guard<std::mutex> lock(gPluginHandlerLock);
+  gPluginHandlerFrozen = true;
+}
 
 // Hands the call's flag to the compiler. The type checker's constraint solver
 // polls ASTContext::CancellationFlag (ConstraintSystem::isTooComplex), and the
@@ -214,11 +225,21 @@ extern "C" void swifthost_request_cancel(void) {
     gCancelFlag->store(true, std::memory_order_relaxed);
 }
 
+extern "C" void
+swifthost_set_plugin_message_handler(swifthost_plugin_message_handler handler) {
+  std::lock_guard<std::mutex> lock(gPluginHandlerLock);
+  if (gPluginHandlerFrozen || !handler)
+    return;
+  swift::InProcessPlugins::setHandleMessageOverride(handler);
+  gPluginHandlerFrozen = true;
+}
+
 extern "C" int swifthost_swift_frontend(int argc, const char **argv,
                                         int out_fd, int err_fd) {
   (void)out_fd;
   if (argc < 1 || !argv)
     return 2;
+  freezePluginHandler();
   return runGuarded(err_fd, [&](bool &poison) {
     FdStream diagOS(err_fd, /*unbuffered=*/true);
     auto flag = std::make_shared<std::atomic<bool>>(false);

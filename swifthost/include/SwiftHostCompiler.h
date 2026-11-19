@@ -65,9 +65,19 @@
  *   runs on the calling thread).
  * - A running frontend call can be cancelled from another thread with
  *   swifthost_request_cancel(); see there.
+ * - Macros: the compiler sends macro expansion requests as JSON messages to an
+ *   in-process plugin server, which is either a dynamic library that exports
+ *   swift_inproc_plugins_handle_message (-in-process-plugin-server-path) or
+ *   the app's own handler (swifthost_set_plugin_message_handler). Executable
+ *   plugins (-load-plugin-executable, -external-plugin-path, the server part
+ *   of -load-resolved-plugin) are rejected with an error diagnostic; they are
+ *   never launched.
  */
 #ifndef SWIFTHOSTCOMPILER_H
 #define SWIFTHOSTCOMPILER_H
+
+#include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,7 +96,7 @@ extern "C" {
 #define SWIFTHOST_MIN_STACK_SIZE 16777216u /* 16 MiB; a plain literal so that Swift imports it */
 
 /* The compiler and library version, for example
-   "Swift version 6.4.2 (swift-6.4.2-RELEASE), swifthost-6.4.2-1".
+   "Swift version 6.4.2 (swift-6.4.2-RELEASE), swifthost-6.4.2-2".
    Static storage; never freed. */
 const char *swifthost_version(void);
 
@@ -116,6 +126,38 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    Callable from any thread; returns immediately. Autolink and wasm-ld calls are
    not cancellable (they are short and bounded by their input). */
 void swifthost_request_cancel(void);
+
+/* Serves one compiler plugin message; the same contract as the
+   swift_inproc_plugins_handle_message entry point of an in-process plugin
+   server library. message/length: the request (JSON, not NUL-terminated,
+   valid only during the call). Store a buffer allocated with malloc() in
+   *response and its size in *response_length; the compiler releases it with
+   free(). Return false with the reply message, or true with an error message
+   (the compiler reports it for the macro). Called on the thread running the
+   swifthost_swift_frontend call, inside that call; it must not call into this
+   library. */
+typedef bool (*swifthost_plugin_message_handler)(const char *message,
+                                                 size_t length,
+                                                 char **response,
+                                                 size_t *response_length);
+
+/* Makes the compiler pass every plugin message to handler instead of loading
+   an in-process plugin server library. Call it once, before the first
+   swifthost_swift_frontend call: a later call, a second call or a NULL
+   handler does nothing. The handler is process-wide and stays set.
+   Frontend calls still select the in-process route with
+   -in-process-plugin-server-path <path>; with a handler set, <path> is only
+   an identifier (it is never opened and need not exist). Macro modules are
+   named with -load-resolved-plugin <library>##<Module>: the handler receives
+   <library> (an existing file; the compiler resolves symbolic links) in the
+   loadPluginLibrary message. A malformed reply (not JSON, truncated, empty,
+   the wrong message kind, positions outside the source) fails that macro
+   with an error diagnostic (return value 1). A crash in the handler, and a
+   reply nested so deeply that the compiler's JSON parser overflows the
+   calling thread's stack, are recovered like a compiler crash: they poison
+   the library. The reply's length must be the size of the buffer. */
+void swifthost_set_plugin_message_handler(
+    swifthost_plugin_message_handler handler);
 
 #ifdef __cplusplus
 }
