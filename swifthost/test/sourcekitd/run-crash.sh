@@ -110,6 +110,7 @@ run overflow --overflow "$WORK/in/deep.swift" --slow "$WORK/in/slow.swift"
 run fatal
 run frontend-fatal
 run macro "${long[@]}"
+run app-handler
 run attribution --crasher "$WORK/in/$SYNC_CRASHER" --crasher-offset "$SYNC_OFF"
 run receivers
 run_dies receiver-crash

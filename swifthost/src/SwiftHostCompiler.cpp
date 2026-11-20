@@ -74,25 +74,40 @@ std::atomic<unsigned> gSourceKitRecoveriesEnded{0};
 thread_local llvm::CrashRecoveryContext *tSourceKitRecovery = nullptr;
 thread_local bool tSourceKitRecoveryBooked = false;
 
-// Test hook (SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS, read once at setup):
-// a work item whose crash was recovered waits this long before it counts the
-// recovery as ended, as if its thread were preempted right there.
+// Test hook only (SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS, read once at
+// setup; the tests link the release object, so it stays in): a work item
+// whose crash was recovered waits this long before it counts the recovery as
+// ended, as if its thread were preempted right there. Frontend calls wait for
+// it meanwhile (up to kRecoveryWaitLimit each, then they may be poisoned).
 std::atomic<unsigned> gTestRecoveryDelayMs{0};
 
 // Called on the crashing thread, from the signal handler or the fatal error
 // router, before LLVM counts the recovery: counts a crash that the work item's
-// own crash recovery context is about to recover as sourcekitd's.
-// Async-signal-safe.
-void bookSourceKitRecovery() {
+// own crash recovery context is about to recover as sourcekitd's. Returns
+// whether this call counted it. Async-signal-safe.
+bool bookSourceKitRecovery() {
   llvm::CrashRecoveryContext *crc = tSourceKitRecovery;
   if (!crc || tSourceKitRecoveryBooked ||
       llvm::CrashRecoveryContext::GetCurrent() != crc)
-    return;
+    return false;
   tSourceKitRecoveryBooked = true;
   gSourceKitRecoveriesBegun.fetch_add(1, std::memory_order_seq_cst);
   // Orders this count before LLVM's (relaxed) count of the same recovery.
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  return true;
 }
+
+#if SWIFTHOST_SOURCEKIT
+// Counts the booked recovery of this thread as ended, if there is one: once
+// the work item's RunSafely has returned, or when the crash it was booked for
+// turned out not to be recovered after all. Async-signal-safe.
+void endSourceKitRecovery() {
+  if (!tSourceKitRecoveryBooked)
+    return;
+  tSourceKitRecoveryBooked = false;
+  gSourceKitRecoveriesEnded.fetch_add(1, std::memory_order_seq_cst);
+}
+#endif
 
 // What the calling thread is doing, for the fatal error router: a frontend
 // or autolink call (Compiler) or a wasm-ld call (Linker), with the call's
@@ -329,42 +344,92 @@ std::mutex gRecoveryLock;
 unsigned gRecoveryUsers = 0;
 
 #if SWIFTHOST_SOURCEKIT
-// The signals crash recovery handles (CrashRecoveryContext.cpp), and the
-// handler crash recovery installed for each.
+// The signals crash recovery handles (CrashRecoveryContext.cpp).
 constexpr int kRecoverySignals[] = {SIGABRT, SIGBUS,  SIGFPE,
                                     SIGILL,  SIGSEGV, SIGTRAP};
 constexpr size_t kNumRecoverySignals =
     sizeof(kRecoverySignals) / sizeof(kRecoverySignals[0]);
-std::atomic<void (*)(int)> gRecoveryHandlers[kNumRecoverySignals];
 
-// Runs in front of crash recovery's signal handler, so that a crash in
-// sourcekitd's work is counted as sourcekitd's before LLVM counts it.
+// LLVM's crash recovery signal handler (a file-static function there, the
+// same for every signal and for the life of the process), learned from the
+// first Enable that installs it (learnRecoveryHandler); null until then.
+std::atomic<void (*)(int)> gLLVMRecoveryHandler{nullptr};
+
+// Runs directly in front of LLVM's crash recovery signal handler, so that a
+// crash in sourcekitd's work is counted as sourcekitd's before LLVM counts
+// it. It is only ever installed over LLVM's handler and only forwards to it.
+// LLVM's handler does not return for a crash on a thread with a crash
+// recovery context, which booking requires; should it return all the same,
+// no recovery took place and the booking is ended right here, so a booking
+// never stays open.
 void bookingSignalHandler(int signal) {
-  bookSourceKitRecovery();
-  for (size_t i = 0; i < kNumRecoverySignals; ++i) {
-    if (kRecoverySignals[i] != signal)
-      continue;
-    if (void (*handler)(int) = gRecoveryHandlers[i].load()) {
-      handler(signal);
-      return;
-    }
+  bool booked = bookSourceKitRecovery();
+  if (void (*handler)(int) = gLLVMRecoveryHandler.load()) {
+    handler(signal);
+    if (booked)
+      endSourceKitRecovery();
+    return;
   }
-  // Not reached: the handler is only installed in front of another one.
+  // Not reached: the handler is only installed once LLVM's is known.
+  if (booked)
+    endSourceKitRecovery();
   ::signal(signal, SIG_DFL);
   raise(signal);
 }
 
-// Puts bookingSignalHandler in front of the handlers that crash recovery has
-// installed, unless it is there already. Under gRecoveryLock.
+void readRecoveryHandlers(void (*handlers[kNumRecoverySignals])(int),
+                          int flags[kNumRecoverySignals]) {
+  for (size_t i = 0; i < kNumRecoverySignals; ++i) {
+    struct sigaction current;
+    if (sigaction(kRecoverySignals[i], nullptr, &current) != 0) {
+      handlers[i] = nullptr;
+      flags[i] = 0;
+      continue;
+    }
+    handlers[i] = current.sa_handler;
+    flags[i] = current.sa_flags;
+  }
+}
+
+// Learns LLVM's handler from an Enable call: before (the handlers read just
+// before it) differs from the handlers right after it only when that Enable
+// installed LLVM's handlers, one function for all six signals with
+// SA_ONSTACK and without SA_SIGINFO. Anything else (crash recovery already
+// enabled, or another handler installed in between) teaches nothing; until
+// a later Enable does, the booking handler is not installed and a crash in
+// sourcekitd's work is not attributed (a frontend call running meanwhile
+// is poisoned). Under gRecoveryLock.
+void learnRecoveryHandler(void (*const before[kNumRecoverySignals])(int)) {
+  if (gLLVMRecoveryHandler.load())
+    return;
+  void (*after[kNumRecoverySignals])(int);
+  int flags[kNumRecoverySignals];
+  readRecoveryHandlers(after, flags);
+  void (*candidate)(int) = after[0];
+  if (!candidate || candidate == SIG_DFL || candidate == SIG_IGN)
+    return;
+  for (size_t i = 0; i < kNumRecoverySignals; ++i)
+    if (after[i] != candidate || after[i] == before[i] ||
+        (flags[i] & SA_SIGINFO) || !(flags[i] & SA_ONSTACK))
+      return;
+  gLLVMRecoveryHandler.store(candidate);
+}
+
+// Puts bookingSignalHandler directly in front of LLVM's crash recovery
+// handler, for each signal whose current handler is LLVM's. A handler the app
+// installed over LLVM's (or over the booking handler) while crash recovery
+// was enabled is left alone: the booking handler forwards only to LLVM's, and
+// a handler of the app's that deals with a fault itself never passes through
+// it. Under gRecoveryLock.
 void installRecoveryBooking() {
+  void (*llvmHandler)(int) = gLLVMRecoveryHandler.load();
+  if (!llvmHandler)
+    return;
   for (size_t i = 0; i < kNumRecoverySignals; ++i) {
     struct sigaction current;
     if (sigaction(kRecoverySignals[i], nullptr, &current) != 0 ||
-        (current.sa_flags & SA_SIGINFO) ||
-        current.sa_handler == bookingSignalHandler ||
-        current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN)
+        (current.sa_flags & SA_SIGINFO) || current.sa_handler != llvmHandler)
       continue;
-    gRecoveryHandlers[i].store(current.sa_handler);
     struct sigaction booking = current;
     booking.sa_handler = bookingSignalHandler;
     sigaction(kRecoverySignals[i], &booking, nullptr);
@@ -379,11 +444,20 @@ public:
     ++gRecoveryUsers;
     // Also when already counted: a crash on a thread without a crash recovery
     // context disables crash recovery behind the count's back.
-    llvm::CrashRecoveryContext::Enable();
 #if SWIFTHOST_SOURCEKIT
+    void (*before[kNumRecoverySignals])(int) = {};
+    int beforeFlags[kNumRecoverySignals];
+    bool learning = !gLLVMRecoveryHandler.load();
+    if (learning)
+      readRecoveryHandlers(before, beforeFlags);
+    llvm::CrashRecoveryContext::Enable();
+    if (learning)
+      learnRecoveryHandler(before);
     // Disabling crash recovery (when the last user ends) restores the
     // handlers from before it was enabled, which removes this one as well.
     installRecoveryBooking();
+#else
+    llvm::CrashRecoveryContext::Enable();
 #endif
   }
   ~CrashRecoveryUse() {
@@ -712,12 +786,15 @@ template <typename Fn> void runSourceKitProtected(Fn fn) {
     bool completed = crc.RunSafely(fn);
     tSourceKitRecovery = nullptr;
     tAppCalls = nullptr;
+    if (!completed && tSourceKitRecoveryBooked) {
+      if (unsigned delay = gTestRecoveryDelayMs.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    }
+    // Whether or not the work item completed: a booking still open here (a
+    // crash that was booked but did not end in this recovery) must not keep
+    // frontend calls waiting.
+    endSourceKitRecovery();
     if (!completed) {
-      if (tSourceKitRecoveryBooked) {
-        if (unsigned delay = gTestRecoveryDelayMs.load())
-          std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-        gSourceKitRecoveriesEnded.fetch_add(1, std::memory_order_seq_cst);
-      }
       llvm::RestorePrettyStackState(stackState);
       status = recoveryStatus(crc.RetCode, description, sizeof(description));
     }

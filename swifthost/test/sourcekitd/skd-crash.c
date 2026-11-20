@@ -18,6 +18,11 @@
 //   attribution     the crasher while short frontend compiles run back to back, with the test hook
 //                   SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS holding the crashed work item between
 //                   LLVM's count of the recovery and the end of its own: no compile is poisoned
+//   app-handler     a frontend call's macro (served by the app's plugin handler) holds crash recovery
+//                   enabled while the app installs a plain SIGSEGV/SIGBUS handler; then sourcekitd's
+//                   macro expansion faults in the app's plugin handler on a guard page, which the app's
+//                   handler opens (the process survives): neither that call nor later frontend
+//                   calls stall or are poisoned, sourcekitd keeps working
 //   receivers       the app's response receivers and notification handler run outside the
 //                   library's crash recovery (no alternate signal stack of the library's)
 //   receiver-crash  a trap in an async response receiver is not recovered: the process ends with
@@ -51,6 +56,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -589,6 +595,121 @@ static void mode_attribution(const char *crasher, long crasher_offset, int delay
         held, longest_held, answered - sent);
 }
 
+// ---- app-handler: a plain SIGSEGV/SIGBUS handler of the app's, installed while crash recovery is enabled, deals
+// with a fault in sourcekitd's work (the app's plugin message handler touches a guard page, as a runtime with
+// guard pages or a lazily mapped arena would)
+
+static volatile char *guard_page;      // PROT_NONE until the app's handler opens it
+static pthread_t armed_thread;         // the thread that touches guard_page on purpose
+static atomic_int armed, app_faults, handler_calls, sourcekitd_faulted;
+static pthread_t frontend_thread;
+static struct sigaction app_prev[2]; // SIGSEGV, SIGBUS
+static dispatch_semaphore_t app_installed, app_go;
+
+static void app_segv_handler(int sig) {
+  if (atomic_load(&armed) && pthread_equal(pthread_self(), armed_thread)) {
+    atomic_store(&armed, 0);
+    mprotect((void *)guard_page, (size_t)getpagesize(), PROT_READ | PROT_WRITE);
+    atomic_fetch_add(&app_faults, 1);
+    return; // the access is retried and succeeds
+  }
+  // Not the app's fault: hand it on, as crash reporters do (the fault happens again under the old handler).
+  sigaction(sig, &app_prev[sig == SIGBUS], NULL);
+}
+
+static bool app_handler_plugin(const char *message, size_t length, char **response, size_t *response_length) {
+  if (atomic_fetch_add(&handler_calls, 1) == 0) {
+    // The first message is the frontend call's (sourcekitd gets the macro source only after this): the
+    // call holds crash recovery enabled while the app installs its handler and while this message waits.
+    frontend_thread = pthread_self();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = app_segv_handler;
+    sa.sa_flags = SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    // Darwin reports an access to a PROT_NONE page as SIGBUS, an unmapped address as SIGSEGV.
+    sigaction(SIGSEGV, &sa, &app_prev[0]);
+    sigaction(SIGBUS, &sa, &app_prev[1]);
+    dispatch_semaphore_signal(app_installed);
+    dispatch_semaphore_wait(app_go, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));
+  } else if (!pthread_equal(pthread_self(), frontend_thread) && !atomic_exchange(&sourcekitd_faulted, 1)) {
+    // sourcekitd's first message, inside its work item's crash recovery.
+    armed_thread = pthread_self();
+    atomic_store(&armed, 1);
+    char c = guard_page[0];
+    (void)c;
+  }
+  return swift_inproc_plugins_handle_message(message, length, response, response_length);
+}
+
+static void mode_app_handler(const sigsnap_t *before) {
+  size_t page = (size_t)getpagesize();
+  guard_page = mmap(NULL, page, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  app_installed = dispatch_semaphore_create(0);
+  app_go = dispatch_semaphore_create(0);
+
+  // The frontend call: hello's arguments with a macro source instead of hello.swift.
+  char *fe_src = fmt("%s/fe-macro.swift", WORK);
+  write_file(fe_src, "@freestanding(expression) macro answer() -> Int = "
+                     "#externalMacro(module: \"M\", type: \"AnswerMacro\")\nprint(#answer)\n");
+  char *args = read_file(COMPILE_ARGS), *fe_args = fmt("%s/fe-macro.args", WORK);
+  FILE *f = fopen(fe_args, "w");
+  for (char *save, *l = strtok_r(args, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {
+    size_t n = strlen(l);
+    fprintf(f, "%s\n", n >= 12 && !strcmp(l + n - 12, "/hello.swift") ? fe_src : l);
+  }
+  fclose(f);
+  char *lib = fmt("%s/M.wasm", WORK);
+  write_file(lib, "");
+  const char *plugin[] = {"-load-resolved-plugin", fmt("%s##M", lib), NULL};
+  compile_t fe = {.args_file = fe_args, .object = OBJECT, .err_path = fmt("%s/fe-macro.err", WORK),
+                  .extra = plugin};
+  pthread_t t = start_compile(&fe);
+  if (dispatch_semaphore_wait(app_installed, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC))) {
+    CHECK(0, "the frontend call reached the app's plugin handler within 120 s");
+    exit(failures);
+  }
+  CHECK(app_prev[0].sa_handler != before->act[4].sa_handler && app_prev[1].sa_handler != before->act[1].sa_handler,
+        "crash recovery was enabled when the app installed its SIGSEGV/SIGBUS handler (previous handlers %p/%p, "
+        "before sourcekitd_initialize %p/%p)",
+        (void *)app_prev[0].sa_handler, (void *)app_prev[1].sa_handler, (void *)before->act[4].sa_handler,
+        (void *)before->act[1].sa_handler);
+
+  // sourcekitd expands a macro through the app's plugin handler, which faults on the guard page.
+  char *src = fmt("%s/macro.swift", WORK);
+  write_file(src, "@freestanding(expression) macro answer() -> Int = "
+                  "#externalMacro(module: \"M\", type: \"AnswerMacro\")\n"
+                  "let x: Int = #answer\nlet y: String = #answer\n");
+  setenv("SWIFTHOST_TEST_PLUGIN_FILE", src, 1);
+  answer_t o = send_sync(open_request(src));
+  async_t *d = send_async(diag_request(src, plugin));
+  int answered = wait_async(d, 60000);
+  CHECK(!o.is_error && answered && !d->answer.is_error && d->answer.count == 1 && strstr(d->answer.desc, "Int"),
+        "diagnostics with the macro expanded by the app's handler: %s",
+        answered ? describe(&d->answer) : "no answer within 60 s");
+  CHECK(atomic_load(&sourcekitd_faulted) == 1 && atomic_load(&app_faults) == 1,
+        "the app's handler dealt with %d fault(s) in sourcekitd's work", atomic_load(&app_faults));
+  CHECK(swifthost_sourcekitd_status() == 0, "sourcekitd status after the app's fault: %d",
+        swifthost_sourcekitd_status());
+
+  // The frontend call ends without waiting for a recovery that never happened.
+  double released = now_ms();
+  dispatch_semaphore_signal(app_go);
+  pthread_join(t, NULL);
+  double tail = now_ms() - released;
+  CHECK(fe.rc == 0 && tail < 4500, "frontend call holding crash recovery: rc %d, %.0f ms after its release",
+        fe.rc, tail);
+
+  // Later frontend calls neither stall nor are poisoned.
+  for (int i = 0; i < 3; i++) {
+    compile_t c = {.args_file = COMPILE_ARGS, .object = OBJECT, .err_path = fmt("%s/later%d.err", WORK, i)};
+    run_compile(&c);
+    CHECK(c.rc == 0 && c.ms < 4500, "later frontend call %d: rc %d, %.0f ms", i + 1, c.rc, c.ms);
+  }
+  check_healthy("after the app's fault");
+  CHECK(swifthost_sourcekitd_status() == 0, "sourcekitd status at the end: %d", swifthost_sourcekitd_status());
+}
+
 typedef struct {
   const char *mode, *crasher, *overflow, *slow, *long_args, *long_object;
   long crasher_offset;
@@ -666,6 +787,8 @@ static int run_mode(options_t *o) {
   int macro = !strcmp(mode, "macro");
   if (macro)
     swifthost_set_plugin_message_handler(swift_inproc_plugins_handle_message);
+  else if (!strcmp(mode, "app-handler"))
+    swifthost_set_plugin_message_handler(app_handler_plugin);
   sourcekitd_initialize();
   check_healthy("before");
 
@@ -780,6 +903,8 @@ static int run_mode(options_t *o) {
   } else if (!strcmp(mode, "attribution")) {
     mode_attribution(crasher, crasher_offset, 2000);
     check_stopped(swifthost_sourcekitd_status(), crash_desc(swifthost_sourcekitd_status()));
+  } else if (!strcmp(mode, "app-handler")) {
+    mode_app_handler(&before);
   } else if (!strcmp(mode, "receivers")) {
     mode_receivers();
   } else if (!strcmp(mode, "receiver-crash") || !strcmp(mode, "notification-crash")) {
