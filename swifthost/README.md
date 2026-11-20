@@ -75,7 +75,8 @@ Measured with `test/smoke.c` on macOS on a Mac mini (Apple M4) shared with other
 Peak memory (resident) of the whole process: about 180 MiB after hello world builds, 440-500 MiB after Foundation
 builds. Stack: the calling thread used 80 KiB for these programs (clang module builds run on their own 8 MiB helper
 thread); `SWIFTHOST_MIN_STACK_SIZE` is headroom for deeply nested source. `swifthost_request_cancel()` stopped a long
-type check within 2-8 ms, among top-level statements as well as among function bodies.
+type check within 2-8 ms, among top-level statements, among function bodies and (since `-5`) inside one long
+function body.
 
 In the iOS 27.2 simulator on the same Mac, in two runs while other builds were using the Mac, every step was 5-100x
 slower (hello world 1.3-9 s for the first build and 0.03-0.6 s later, Foundation frontend 0.8-8.8 s, wasm-ld 0.6-7.4 s,
@@ -129,6 +130,30 @@ awaits still overflow the stack.
 
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
+
+## Changes in swifthost-6.4.2-5
+
+- `swifthost_request_cancel()` no longer waits for the end of the stage it lands in: type checking stops at the
+  next statement of a function body (one function of 4,000 statements, cancelled after 300 ms of the call's CPU time,
+  returns after about 3 ms of CPU time instead of 2.8 s, with one diagnostic instead of about 4,000), SIL generation
+  at the next statement, the SIL passes at the next pass or inside the long ones (sendable checking, ARC optimization,
+  copy propagation, Mem2Reg), IR generation at the next function, and LLVM before code generation. What still runs
+  to the end is listed in the header. Before it returns, a cancelled call frees what it built; for the sendable
+  checking of a function of thousands of statements that can be GBs, at about a quarter of a second of CPU time
+  per GB. Uncancelled compiles produce the same objects as with `-4`.
+- A cancel that landed in SIL generation could crash the call with `-4` (for example "Assertion failed: (init),
+  function emitApplyAllocatingInitializer", or a signal), after which every later call returned 125: SIL generation
+  type-checks synthesized code (derived `Equatable`, `Hashable`, `Codable` and `RawRepresentable` members) on demand,
+  and went on with what the cancelled type check had left. Such code now becomes an error body, and SIL generation
+  stops at its next statement, also inside expressions such as string interpolations.
+- A cancelled call reports one diagnostic of its own, `<unknown>:0: error: compilation cancelled` (diagnostic ID
+  `compilation_cancelled`, see the header), and nothing after it. With `-4`, most cancelled builds also reported
+  "the compiler is unable to type-check this expression in reasonable time" for the expressions the type checker
+  gave up on, and a cancel after type checking reported nothing.
+- sourcekitd: the code completion after a cancelled one could reuse the cancelled one's half-checked AST and
+  return no results; a cancelled operation now leaves nothing for reuse.
+- The twelve swift fork commits since `-4` are listed under Source and patches. llvm-project, swift-syntax, the API,
+  `JOBS.txt` and the built-in macro module are the same as in `-4`.
 
 ## Changes in swifthost-6.4.2-4
 
@@ -224,7 +249,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `043f6938c4b458b2f4e6becbea623d5ecd8846e2` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `c826bc47de2d1a9232171e71ede3a4a05a37e603` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -271,6 +296,27 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
     (outside its crash recovery).
   - `[sourcekitd]` (`043f6938c4b`) `ServiceHooks::ShouldInstallFatalErrorHandler`: `sourcekitd_initialize` keeps the
     host's LLVM fatal error handler.
+- Finer cancellation (from `swifthost-6.4.2-5`; each stage checks `ASTContext::CancellationFlag` at its statement,
+  function or pass boundaries, so a cancel no longer waits for the end of the stage):
+  - `[AST]` (`285064fad14`) `ASTContext::isCancellationRequested()`.
+  - `[Sema]` (`18aa4d6f544`) the type checker stops at the next statement of a body and before the next expression,
+    leaves an error body behind (like a failed result builder) and reports one "compilation cancelled" error.
+    Before, it checked every remaining statement of the body (each one failing as "too complex").
+  - `[IDETool]` (`6068fcb184a`) a cancelled code completion or compile does not leave its compiler instance for
+    reuse. Before, the completion after a cancelled one could reuse a half-checked AST and return no results.
+  - `[SILGen]` (`9fe9b8aca87`) SIL generation stops at the next statement or declaration (inside an expression,
+    such as a string interpolation, it goes on in an unreachable block).
+  - `[SILOptimizer]` (`619e4100ff6`) the pass manager runs no further pass and the passes with sub-pass bisection
+    stop at their next sub-pass; nothing runs on the module after a cancelled pipeline, and no lowered SIL is written.
+  - `[SILOptimizer]` (`66e278d2aee`) region analysis (sendable checking) stops at its next block.
+  - `[SILOptimizer]` (`4977df53e98`) the sendable checking's diagnostic walk (SendNonSendable) stops at its next
+    block and emits nothing.
+  - `[SILOptimizer]` (`f90f8a68441`, `b2e93fae953`) SemanticARCOpts and Mem2Reg stop at their next worklist item.
+  - `[IRGen]` (`547fc71f131`) IR generation stops at the next function and returns no module.
+  - `[IRGen]` (`69250f0a024`) LLVM skips its remaining optional passes and stops before code generation, without
+    leaving an object file (`IRGenOptions::CancellationFlag`). Code generation itself runs to the end.
+  - `[Frontend][Sema]` (`c826bc47de2`) a cancelled compilation reports exactly one diagnostic, the fatal error
+    "compilation cancelled" (no "too complex" errors from the solver, nothing reported after the cancel).
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 

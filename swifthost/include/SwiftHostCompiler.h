@@ -232,18 +232,33 @@ int swifthost_swift_autolink_extract(int argc, const char **argv, int out_fd,
 /* argv[0] = "wasm-ld", then wasm-ld arguments. */
 int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
 
-/* Asks the swifthost_swift_frontend call that is running (on another thread) to
-   stop early: the type checker stops at its next top-level declaration,
-   function body or constraint-solver step, and the pipeline stops after the
-   stage it is in (SIL generation, SIL optimization, SIL lowering, IR
-   generation; LLVM code generation itself is not interruptible). That call then
-   returns SWIFTHOST_ECANCELED, or its normal result if it finished first.
-   Ignore the diagnostics and outputs of a cancelled call: a solver step that
-   was stopped reports "the compiler is unable to type-check this expression in
-   reasonable time". Does nothing when no frontend call is running (a call still
-   waiting for its turn is not affected), and never affects a later call.
-   Callable from any thread; returns immediately. Autolink and wasm-ld calls are
-   not cancellable (they are short and bounded by their input). */
+/* Asks the swifthost_swift_frontend call that is running (on another thread)
+   to stop early. The call checks often: the type checker before its next
+   statement, declaration, function body or constraint-solver step; SIL
+   generation before its next statement or declaration; the SIL optimizer
+   before its next pass and inside the passes and analyses that take long on
+   large functions; IR generation before its next function; LLVM skips its
+   remaining optimization passes and stops before code generation. What runs to
+   the end once started: one expression's constraint generation, module
+   loading, one SIL pass on one function, and LLVM code generation of the whole
+   module (up to seconds for a function of thousands of statements). Before it
+   returns, the call frees what it built: the sendable checking of one function
+   of thousands of statements can build GBs, and freeing them takes about a
+   quarter of a second of CPU time per GB. That call then returns
+   SWIFTHOST_ECANCELED, or its normal result if it finished first. A call that
+   returns SWIFTHOST_ECANCELED has not written its object file (a file already
+   at the output path is left as it was; with -num-threads, the object files of
+   the modules finished before the cancel are removed). Its only diagnostic
+   of its own is the error "compilation cancelled" (diagnostic ID
+   compilation_cancelled), reported once and without a source location, so
+   that its line reads
+     <unknown>:0: error: compilation cancelled
+   Nothing is reported after it; diagnostics reported before the cancel (about
+   the code) stay. Ignore the outputs of a cancelled call. Does nothing when
+   no frontend call is running (a call still waiting for its turn is not
+   affected), and never affects a later call. Callable from any thread; returns
+   immediately. Autolink and wasm-ld calls are not cancellable (they are short
+   and bounded by their input). */
 void swifthost_request_cancel(void);
 
 /* 0 while the in-process sourcekitd works, otherwise what stopped it: the

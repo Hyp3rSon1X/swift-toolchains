@@ -241,12 +241,13 @@ bool handlePluginMessage(const char *serverPath, const char *message,
   return hadError;
 }
 
-// Hands the call's flag to the compiler. The type checker's constraint solver
-// polls ASTContext::CancellationFlag (ConstraintSystem::isTooComplex), and the
-// frontend checks it after SIL generation, SIL optimization, SIL lowering and
-// IR generation. Also keeps the frontend from replacing the process-wide
-// fatal error handler (the router below), which sourcekitd's threads need
-// while a frontend call runs.
+// Hands the call's flag to the compiler (ASTContext::CancellationFlag). The
+// type checker, SIL generation, the SIL pass manager, IR generation and (via
+// IRGenOptions, which the frontend fills in from the ASTContext) LLVM check it
+// at their statement, function and pass boundaries, and the frontend returns
+// an error once it is set. Also keeps the frontend from replacing the
+// process-wide fatal error handler (the router below), which sourcekitd's
+// threads need while a frontend call runs.
 class CancellationObserver : public swift::FrontendObserver {
 public:
   explicit CancellationObserver(std::shared_ptr<std::atomic<bool>> flag)
