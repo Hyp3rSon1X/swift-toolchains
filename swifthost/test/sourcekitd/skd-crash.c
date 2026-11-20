@@ -15,6 +15,14 @@
 //                   library, sourcekitd keeps working
 //   macro           a macro in a sourcekitd request reaches the app's plugin message handler
 //                   (swifthost_set_plugin_message_handler), during a frontend compile
+//   attribution     the crasher while short frontend compiles run back to back, with the test hook
+//                   SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS holding the crashed work item between
+//                   LLVM's count of the recovery and the end of its own: no compile is poisoned
+//   receivers       the app's response receivers and notification handler run outside the
+//                   library's crash recovery (no alternate signal stack of the library's)
+//   receiver-crash  a trap in an async response receiver is not recovered: the process ends with
+//                   SIGTRAP (run-crash.sh checks that), sourcekitd is not reported as stopped
+//   notification-crash  the same for a trap in the notification handler
 //
 // After a crash mode stopped sourcekitd, the test checks: the crashing request got the agreed error,
 // swifthost_sourcekitd_status() returns the signal, later requests (sync and async) fail at once,
@@ -271,6 +279,19 @@ static const char *describe(const answer_t *a) {
   return buf;
 }
 
+// Whether the calling thread runs on an alternate signal stack of the library's size (256 KiB):
+// the library gives one to every work item of sourcekitd's that it runs under crash recovery.
+static int on_library_signal_stack(void) {
+  stack_t ss;
+  return !sigaltstack(NULL, &ss) && !(ss.ss_flags & SS_DISABLE) && ss.ss_size == 256 * 1024;
+}
+
+static sourcekitd_object_t test_notification_request(void) {
+  sourcekitd_object_t req = sourcekitd_request_dictionary_create(NULL, NULL, 0);
+  sourcekitd_request_dictionary_set_uid(req, U("key.request"), U("source.request.test_notification"));
+  return req;
+}
+
 // ---- frontend calls (on a thread with a large stack, as the library requires)
 
 typedef struct {
@@ -384,6 +405,199 @@ static const char *crash_desc(int signal) {
   return fmt("sourcekitd stopped: recovered crash (signal %d)", signal);
 }
 
+// ---- the modes that need more than a request
+
+typedef struct {
+  const char *name;
+  dispatch_semaphore_t done;
+  int outside, main_thread;
+  answer_t answer;
+} probe_t;
+
+static probe_t *probe_new(const char *name) {
+  probe_t *p = calloc(1, sizeof *p);
+  p->name = name;
+  p->done = dispatch_semaphore_create(0);
+  return p;
+}
+
+static void probe_async(probe_t *p, sourcekitd_object_t req) {
+  double sent = now_ms();
+  sourcekitd_send_request(req, NULL, ^(sourcekitd_response_t r) {
+    p->outside = !on_library_signal_stack();
+    p->answer = summarize(r, now_ms() - sent);
+    dispatch_semaphore_signal(p->done);
+  });
+  sourcekitd_request_release(req);
+}
+
+static void check_probe(probe_t *p) {
+  int answered = !dispatch_semaphore_wait(p->done, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+  CHECK(answered && p->outside && !p->answer.is_error, "%s receiver ran outside the library's crash recovery: %s",
+        p->name, answered ? describe(&p->answer) : "no answer within 30 s");
+}
+
+// Marks the main queue (after dispatch_main() it runs on a thread that is not the main thread).
+static char kMainQueueKey;
+
+static void mode_receivers(void) {
+  dispatch_queue_set_specific(dispatch_get_main_queue(), &kMainQueueKey, &kMainQueueKey, NULL);
+  // The probe itself: it sees an alternate stack of the library's size.
+  stack_t mine = {.ss_sp = malloc(256 * 1024), .ss_size = 256 * 1024};
+  sigaltstack(&mine, NULL);
+  int seen = on_library_signal_stack();
+  // Darwin wants at least MINSIGSTKSZ even to disable it.
+  sigaltstack(&(stack_t){.ss_flags = SS_DISABLE, .ss_size = MINSIGSTKSZ}, NULL);
+  free(mine.ss_sp);
+  CHECK(seen && !on_library_signal_stack(), "the probe detects a 256 KiB alternate signal stack");
+
+  __block probe_t *note = probe_new("notification handler");
+  sourcekitd_set_notification_handler(^(sourcekitd_response_t r) {
+    sourcekitd_variant_t v = sourcekitd_response_get_value(r);
+    if (sourcekitd_variant_dictionary_get_uid(v, U("key.notification")) == U("source.notification.test")) {
+      note->outside = !on_library_signal_stack();
+      note->main_thread = dispatch_get_specific(&kMainQueueKey) == &kMainQueueKey;
+      dispatch_semaphore_signal(note->done);
+    }
+    sourcekitd_response_dispose(r);
+  });
+  probe_t *complete = probe_new("completion"), *open = probe_new("editor.open"), *diag = probe_new("diagnostics"),
+          *test = probe_new("test_notification");
+  probe_async(complete, complete_request(HEALTHY, HEALTHY_OFFSET, NULL));
+  probe_async(open, open_request(HEALTHY));
+  probe_async(diag, diag_request(HEALTHY, NULL));
+  check_probe(complete);
+  check_probe(open);
+  check_probe(diag);
+  probe_async(test, test_notification_request());
+  check_probe(test);
+  int arrived = !dispatch_semaphore_wait(note->done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+  CHECK(arrived && note->outside && note->main_thread,
+        "notification handler ran on the main queue (%s) outside the library's crash recovery (%s)",
+        arrived ? (note->main_thread ? "yes" : "NO") : "-",
+        arrived ? (note->outside ? "yes" : "NO") : "no notification within 10 s");
+  CHECK(swifthost_sourcekitd_status() == 0, "sourcekitd status: %d", swifthost_sourcekitd_status());
+}
+
+// Ends the process with SIGTRAP from the app's code that sourcekitd calls; returns only if it did not.
+static void mode_app_trap(int in_notification) {
+  dispatch_semaphore_t reached = dispatch_semaphore_create(0);
+  if (in_notification)
+    sourcekitd_set_notification_handler(^(sourcekitd_response_t r) {
+      (void)r;
+      printf("TRAP in the notification handler, %s the library's crash recovery\n",
+             on_library_signal_stack() ? "INSIDE" : "outside");
+      fflush(stdout);
+      dispatch_semaphore_signal(reached);
+      __builtin_trap();
+    });
+  sourcekitd_object_t req = in_notification ? test_notification_request()
+                                            : complete_request(HEALTHY, HEALTHY_OFFSET, NULL);
+  sourcekitd_send_request(req, NULL, ^(sourcekitd_response_t r) {
+    if (in_notification) {
+      sourcekitd_response_dispose(r);
+      return;
+    }
+    printf("TRAP in the response receiver, %s the library's crash recovery\n",
+           on_library_signal_stack() ? "INSIDE" : "outside");
+    fflush(stdout);
+    dispatch_semaphore_signal(reached);
+    __builtin_trap();
+  });
+  sourcekitd_request_release(req);
+  dispatch_semaphore_wait(reached, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+  // A recovered trap would stop sourcekitd; give it time to show.
+  usleep(2000 * 1000);
+  CHECK(0, "the process survived the trap in the app's code: sourcekitd status %d", swifthost_sourcekitd_status());
+}
+
+typedef struct {
+  double start, end;
+  int rc;
+} timed_compile_t;
+
+typedef struct {
+  atomic_int stop;
+  int count;
+  timed_compile_t runs[4096];
+} compile_loop_t;
+
+static void *compile_loop(void *arg) {
+  compile_loop_t *loop = arg;
+  while (!atomic_load(&loop->stop) && loop->count < 4096) {
+    compile_t c = {.args_file = COMPILE_ARGS, .object = OBJECT, .err_path = fmt("%s/loop.err", WORK)};
+    timed_compile_t *t = &loop->runs[loop->count];
+    t->start = now_ms();
+    compile_main(&c);
+    t->end = now_ms();
+    t->rc = c.rc;
+    loop->count++;
+  }
+  return NULL;
+}
+
+static void mode_attribution(const char *crasher, long crasher_offset, int delay_ms) {
+  // The module cache, so that the loop's compiles are short.
+  compile_t warm = {.args_file = COMPILE_ARGS, .object = OBJECT, .err_path = fmt("%s/warm.err", WORK)};
+  run_compile(&warm);
+  CHECK(warm.rc == 0, "warm-up compile: rc %d, %.0f ms", warm.rc, warm.ms);
+
+  static compile_loop_t loop;
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64u << 20);
+  pthread_t t;
+  pthread_create(&t, &attr, compile_loop, &loop);
+  usleep(1000 * 1000);
+  double sent = now_ms();
+  answer_t a = send_sync(complete_request(crasher, crasher_offset, NULL));
+  double answered = now_ms();
+  int sig = swifthost_sourcekitd_status();
+  CHECK(a.is_error && !strcmp(a.desc, crash_desc(sig)) && sig > 0, "crashing request during the compiles: %s",
+        describe(&a));
+  usleep(1000 * 1000);
+  atomic_store(&loop.stop, 1);
+  pthread_join(t, NULL);
+
+  int bad = 0, before = 0, held = 0;
+  double longest_before = 0, longest_held = 0;
+  for (int i = 0; i < loop.count; i++) {
+    timed_compile_t *r = &loop.runs[i];
+    if (r->rc != 0) {
+      bad++;
+      printf("compile %d: rc %d, %.0f-%.0f ms after the request was sent\n", i, r->rc, r->start - sent,
+             r->end - sent);
+    }
+    double ms = r->end - r->start;
+    if (r->end < sent) {
+      before++;
+      if (ms > longest_before)
+        longest_before = ms;
+    } else if (r->start < answered - delay_ms / 2.0 && r->end > answered - delay_ms / 4.0) {
+      // Running when the crash happened and still running near the end of the recovery's delay.
+      held++;
+      if (ms > longest_held)
+        longest_held = ms;
+    }
+  }
+  CHECK(bad == 0, "%d compiles ran back to back, none failed or poisoned (%d failed)", loop.count, bad);
+  CHECK(before > 0 && longest_before < delay_ms / 2.0,
+        "%d compiles before the crash, the longest %.0f ms (shorter than half the %d ms delay)", before,
+        longest_before, delay_ms);
+  CHECK(held > 0, "%d compile(s) overlapped the delayed end of the recovery (the longest %.0f ms) and were not "
+                  "poisoned; the crashing request was answered %.0f ms after it was sent",
+        held, longest_held, answered - sent);
+}
+
+typedef struct {
+  const char *mode, *crasher, *overflow, *slow, *long_args, *long_object;
+  long crasher_offset;
+} options_t;
+
+static int run_mode(options_t *o);
+
+static void *mode_thread(void *arg) { exit(run_mode(arg)); }
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: see the comment at the top of skd-crash.c\n");
@@ -416,6 +630,27 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--args, --sdk, --mc, --work, --compile-args and --object are required\n");
     return 2;
   }
+  // Read once, when the library first sets itself up.
+  if (!strcmp(mode, "attribution"))
+    setenv("SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS", "2000", 1);
+  static options_t o;
+  o = (options_t){mode, crasher, overflow, slow, long_args, long_object, crasher_offset};
+  // These modes need the main queue (notifications): it runs on the main thread, the mode on another.
+  if (!strcmp(mode, "receivers") || !strcmp(mode, "notification-crash")) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8u << 20);
+    pthread_t t;
+    pthread_create(&t, &attr, mode_thread, &o);
+    dispatch_main();
+  }
+  return run_mode(&o);
+}
+
+static int run_mode(options_t *o) {
+  const char *mode = o->mode, *crasher = o->crasher, *overflow = o->overflow, *slow = o->slow;
+  const char *long_args = o->long_args, *long_object = o->long_object;
+  long crasher_offset = o->crasher_offset;
   mkdir(WORK, 0755);
   printf("mode %s, %s\n", mode, swifthost_version());
 
@@ -542,15 +777,27 @@ int main(int argc, char **argv) {
     pthread_join(t, NULL);
     CHECK(c.rc == 0, "frontend compile that ran at the same time: rc %d, %.0f ms", c.rc, c.ms);
     CHECK(swifthost_sourcekitd_status() == 0, "sourcekitd status: %d", swifthost_sourcekitd_status());
+  } else if (!strcmp(mode, "attribution")) {
+    mode_attribution(crasher, crasher_offset, 2000);
+    check_stopped(swifthost_sourcekitd_status(), crash_desc(swifthost_sourcekitd_status()));
+  } else if (!strcmp(mode, "receivers")) {
+    mode_receivers();
+  } else if (!strcmp(mode, "receiver-crash") || !strcmp(mode, "notification-crash")) {
+    mode_app_trap(!strcmp(mode, "notification-crash"));
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;
   }
 
   if (!slow) {
+    // sourcekitd's background work (semantic info of open documents) may still run for a moment.
     sigsnap_t after;
-    snap(&after);
-    CHECK(same_dispositions(&before, &after), "signal dispositions restored once nothing runs");
+    double t0 = now_ms();
+    do {
+      snap(&after);
+    } while (!same_dispositions(&before, &after) && now_ms() - t0 < 10000 && usleep(50 * 1000) == 0);
+    CHECK(same_dispositions(&before, &after), "signal dispositions restored once nothing runs (after %.0f ms)",
+          now_ms() - t0);
   }
   printf("%s: %d failure(s)\n", mode, failures);
   return failures;

@@ -1,7 +1,9 @@
 #!/bin/bash
 # Crash containment and coexistence test of the in-process sourcekitd (skd-crash.c), macOS: builds
 # skd-crash against a SwiftHostCompiler.o built with SOURCEKIT=1, prepares its inputs and runs every
-# mode in a process of its own. Prints one row per mode; exit status 0 when every mode passed.
+# mode in a process of its own. Prints one row per mode; exit status 0 when every mode passed. The
+# receiver-crash and notification-crash modes pass when their process ends with SIGTRAP from the app's
+# code, outside the library's crash recovery.
 #
 #   run-crash.sh <SwiftHostCompiler.o or .a> <sdk-target-dir> <work-dir> [<long-compile-dir>]
 #
@@ -88,8 +90,19 @@ run() { # <mode> <options...>
   "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
   local rc=$? pass fail
   pass=$(grep -c '^PASS ' "$WORK/$mode.log") fail=$(grep -c '^FAIL ' "$WORK/$mode.log")
-  printf '%-16s exit=%-3s checks: %2d pass, %d fail (%ds)\n' "$mode" "$rc" "$pass" "$fail" $((SECONDS - t0))
+  printf '%-18s exit=%-3s checks: %2d pass, %d fail (%ds)\n' "$mode" "$rc" "$pass" "$fail" $((SECONDS - t0))
   [ "$rc" = 0 ] && [ "$fail" = 0 ] && [ "$pass" -gt 0 ] || { bad=$((bad + 1)); grep '^FAIL ' "$WORK/$mode.log"; }
+}
+run_dies() { # <mode>
+  local mode=$1; shift
+  local t0=$SECONDS
+  "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
+  local rc=$? outside
+  outside=$(grep -c '^TRAP .* outside ' "$WORK/$mode.log")
+  printf '%-18s exit=%-3s trap outside crash recovery: %s (%ds)\n' "$mode" "$rc" "$outside" $((SECONDS - t0))
+  # 128 + SIGTRAP: the trap was not recovered.
+  [ "$rc" = 133 ] && [ "$outside" = 1 ] && ! grep -q '^FAIL ' "$WORK/$mode.log" ||
+    { bad=$((bad + 1)); grep -E '^(FAIL|TRAP) ' "$WORK/$mode.log"; }
 }
 run crash-sync --crasher "$WORK/in/$SYNC_CRASHER" --crasher-offset "$SYNC_OFF"
 run crash-async --crasher "$WORK/in/$ASYNC_CRASHER" --crasher-offset "$ASYNC_OFF"
@@ -97,6 +110,10 @@ run overflow --overflow "$WORK/in/deep.swift" --slow "$WORK/in/slow.swift"
 run fatal
 run frontend-fatal
 run macro "${long[@]}"
+run attribution --crasher "$WORK/in/$SYNC_CRASHER" --crasher-offset "$SYNC_OFF"
+run receivers
+run_dies receiver-crash
+run_dies notification-crash
 if [ -n "$LONG" ]; then
   run during-compile --crasher "$WORK/in/$SYNC_CRASHER" --crasher-offset "$SYNC_OFF" "${long[@]}"
 fi

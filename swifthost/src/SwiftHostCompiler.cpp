@@ -8,6 +8,7 @@
 #include "swift/AST/PluginRegistry.h"
 #include "swift/Basic/Compiler.h"
 #include "swift/Basic/InitializeSwiftModules.h"
+#include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/Version.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/FrontendTool/FrontendTool.h"
@@ -32,7 +33,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -58,9 +61,38 @@ bool gPoisoned = false;
 // options (-Xllvm, or wasm-ld's -mllvm). Guarded by gLock.
 bool gLLVMOptionsSet = false;
 
-// Crashes recovered in sourcekitd's work (see runSourceKitProtected), so that
-// a frontend call does not count them as its own.
-std::atomic<unsigned> gSourceKitRecoveries{0};
+// Crashes recovered in sourcekitd's work, so that a frontend call does not
+// count them as its own (readRecoveryCounts). Each is counted twice: on the
+// crashing thread before LLVM counts the recovery (bookSourceKitRecovery), and
+// once the work item's RunSafely has returned (runSourceKitProtected). While
+// the counts differ, a recovery is between the two.
+std::atomic<unsigned> gSourceKitRecoveriesBegun{0};
+std::atomic<unsigned> gSourceKitRecoveriesEnded{0};
+
+// The crash recovery context of the sourcekitd work item that runs on this
+// thread, and whether its crash has been counted.
+thread_local llvm::CrashRecoveryContext *tSourceKitRecovery = nullptr;
+thread_local bool tSourceKitRecoveryBooked = false;
+
+// Test hook (SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS, read once at setup):
+// a work item whose crash was recovered waits this long before it counts the
+// recovery as ended, as if its thread were preempted right there.
+std::atomic<unsigned> gTestRecoveryDelayMs{0};
+
+// Called on the crashing thread, from the signal handler or the fatal error
+// router, before LLVM counts the recovery: counts a crash that the work item's
+// own crash recovery context is about to recover as sourcekitd's.
+// Async-signal-safe.
+void bookSourceKitRecovery() {
+  llvm::CrashRecoveryContext *crc = tSourceKitRecovery;
+  if (!crc || tSourceKitRecoveryBooked ||
+      llvm::CrashRecoveryContext::GetCurrent() != crc)
+    return;
+  tSourceKitRecoveryBooked = true;
+  gSourceKitRecoveriesBegun.fetch_add(1, std::memory_order_seq_cst);
+  // Orders this count before LLVM's (relaxed) count of the same recovery.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+}
 
 // What the calling thread is doing, for the fatal error router: a frontend
 // or autolink call (Compiler) or a wasm-ld call (Linker), with the call's
@@ -227,8 +259,8 @@ void writeText(int fd, const char *text) { writeAll(fd, text, std::strlen(text))
 
 // LLVM's one fatal error handler for the whole process (report_fatal_error),
 // installed by the library for good: the frontend calls do not install their
-// own (CancellationObserver), and it replaces the one sourcekitd_initialize
-// installs. It reports each fatal error where the thread's work belongs:
+// own (CancellationObserver), nor does sourcekitd_initialize
+// (shouldInstallFatalErrorHandler). It reports each fatal error where the thread's work belongs:
 // a frontend or linker call's err_fd, or sourcekitd's crash containment.
 void routeFatalError(void *, const char *reason, bool) {
   switch (tRole) {
@@ -261,8 +293,10 @@ void routeFatalError(void *, const char *reason, bool) {
   // Return to the thread's crash recovery right away: LLVM would first remove
   // every file registered for removal in the process, including the output
   // files of a frontend call that runs at the same time.
-  if (llvm::CrashRecoveryContext *crc = llvm::CrashRecoveryContext::GetCurrent())
+  if (llvm::CrashRecoveryContext *crc = llvm::CrashRecoveryContext::GetCurrent()) {
+    bookSourceKitRecovery();
     crc->HandleExit(1);
+  }
 }
 
 void installFatalErrorRouter() {
@@ -278,6 +312,13 @@ void ensureProcessSetup() {
     installFatalErrorRouter();
     swift::InProcessPlugins::setHandleMessageOverride(handlePluginMessage);
     initializeSwiftModules();
+    // LLVM's targets, before any wasm-ld call: wasm-ld registers them at
+    // every link without a guard, which can link a target into the registry
+    // twice when it is not registered yet, and only rewrites its entries with
+    // the same values once it is.
+    swift::initializeLLVMOnce();
+    if (const char *delay = getenv("SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS"))
+      gTestRecoveryDelayMs.store((unsigned)strtoul(delay, nullptr, 10));
   });
 }
 
@@ -287,6 +328,50 @@ void ensureProcessSetup() {
 std::mutex gRecoveryLock;
 unsigned gRecoveryUsers = 0;
 
+#if SWIFTHOST_SOURCEKIT
+// The signals crash recovery handles (CrashRecoveryContext.cpp), and the
+// handler crash recovery installed for each.
+constexpr int kRecoverySignals[] = {SIGABRT, SIGBUS,  SIGFPE,
+                                    SIGILL,  SIGSEGV, SIGTRAP};
+constexpr size_t kNumRecoverySignals =
+    sizeof(kRecoverySignals) / sizeof(kRecoverySignals[0]);
+std::atomic<void (*)(int)> gRecoveryHandlers[kNumRecoverySignals];
+
+// Runs in front of crash recovery's signal handler, so that a crash in
+// sourcekitd's work is counted as sourcekitd's before LLVM counts it.
+void bookingSignalHandler(int signal) {
+  bookSourceKitRecovery();
+  for (size_t i = 0; i < kNumRecoverySignals; ++i) {
+    if (kRecoverySignals[i] != signal)
+      continue;
+    if (void (*handler)(int) = gRecoveryHandlers[i].load()) {
+      handler(signal);
+      return;
+    }
+  }
+  // Not reached: the handler is only installed in front of another one.
+  ::signal(signal, SIG_DFL);
+  raise(signal);
+}
+
+// Puts bookingSignalHandler in front of the handlers that crash recovery has
+// installed, unless it is there already. Under gRecoveryLock.
+void installRecoveryBooking() {
+  for (size_t i = 0; i < kNumRecoverySignals; ++i) {
+    struct sigaction current;
+    if (sigaction(kRecoverySignals[i], nullptr, &current) != 0 ||
+        (current.sa_flags & SA_SIGINFO) ||
+        current.sa_handler == bookingSignalHandler ||
+        current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN)
+      continue;
+    gRecoveryHandlers[i].store(current.sa_handler);
+    struct sigaction booking = current;
+    booking.sa_handler = bookingSignalHandler;
+    sigaction(kRecoverySignals[i], &booking, nullptr);
+  }
+}
+#endif
+
 class CrashRecoveryUse {
 public:
   CrashRecoveryUse() {
@@ -295,6 +380,11 @@ public:
     // Also when already counted: a crash on a thread without a crash recovery
     // context disables crash recovery behind the count's back.
     llvm::CrashRecoveryContext::Enable();
+#if SWIFTHOST_SOURCEKIT
+    // Disabling crash recovery (when the last user ends) restores the
+    // handlers from before it was enabled, which removes this one as well.
+    installRecoveryBooking();
+#endif
   }
   ~CrashRecoveryUse() {
     std::lock_guard<std::mutex> lock(gRecoveryLock);
@@ -377,18 +467,40 @@ private:
   stack_t previous = {};
 };
 
-// Whether crashes other than sourcekitd's own were recovered since the
-// counts were taken. A crash in sourcekitd's work is counted by LLVM first
-// and by runSourceKitProtected right after its recovery returns, so a count
-// that differs is read again after a moment.
-bool recoveredOtherCrashes(unsigned crashes, unsigned sourceKitCrashes) {
-  for (int attempt = 0;; ++attempt) {
-    unsigned all = llvm::CrashRecoveryContext::getNumRecoveredCrashes() - crashes;
-    unsigned sourceKit =
-        gSourceKitRecoveries.load(std::memory_order_acquire) - sourceKitCrashes;
-    if (all <= sourceKit || attempt == 2)
-      return all > sourceKit;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+// LLVM's count of the crashes recovered in the process, and how many of them
+// were sourcekitd's.
+struct RecoveryCounts {
+  unsigned all;
+  unsigned sourceKit;
+};
+
+// How long readRecoveryCounts waits for a recovery in sourcekitd's work to
+// complete. It takes microseconds (the thread returns from its signal handler
+// or fatal error to its RunSafely); the limit only matters for a thread that
+// is stopped in between.
+constexpr auto kRecoveryWaitLimit = std::chrono::seconds(5);
+
+// Reads the counts at a moment when no recovery in sourcekitd's work is
+// between its two counts, so that each is in both counts or in neither: every
+// crash LLVM counted on such a thread is then in sourceKit as well. Another
+// recovery after that point, or one that is not sourcekitd's, appears in all
+// only.
+RecoveryCounts readRecoveryCounts(bool atEnd) {
+  auto limit = std::chrono::steady_clock::now() + kRecoveryWaitLimit;
+  for (;;) {
+    unsigned begun = gSourceKitRecoveriesBegun.load();
+    unsigned ended = gSourceKitRecoveriesEnded.load();
+    unsigned all = llvm::CrashRecoveryContext::getNumRecoveredCrashes();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    unsigned begunAgain = gSourceKitRecoveriesBegun.load();
+    if (begun == ended && begun == begunAgain)
+      return {all, begun};
+    if (std::chrono::steady_clock::now() >= limit) {
+      // Leave recoveries in progress out of sourcekitd's share of the call's
+      // window, which may poison the call but never hides one of its own.
+      return {all, atEnd ? ended : begunAgain};
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }
 
@@ -417,9 +529,7 @@ int runGuarded(ThreadRole role, int argc, const char **argv, int errFd,
 
   ThreadRoleScope roleScope(role, errFd);
   AlternateSignalStack altStack;
-  unsigned crashes = llvm::CrashRecoveryContext::getNumRecoveredCrashes();
-  unsigned sourceKitCrashes =
-      gSourceKitRecoveries.load(std::memory_order_acquire);
+  RecoveryCounts before = readRecoveryCounts(/*atEnd=*/false);
   const void *stackState = llvm::SavePrettyStackState();
   bool poison = false;
   int rc;
@@ -433,7 +543,8 @@ int runGuarded(ThreadRole role, int argc, const char **argv, int errFd,
   // serialized; a recovery that is not sourcekitd's own was this call's (or
   // one in a helper thread of sourcekitd's, which cannot be told apart: it
   // poisons too).
-  if (recoveredOtherCrashes(crashes, sourceKitCrashes))
+  RecoveryCounts after = readRecoveryCounts(/*atEnd=*/true);
+  if ((int)(after.all - before.all) > (int)(after.sourceKit - before.sourceKit))
     poison = true;
   if (poison) {
     // The recovery skipped the destructors of the pretty stack trace entries
@@ -538,45 +649,85 @@ void stopSourceKit(int status, std::string description) {
       answerStopped(request->receiver, request->synchronous);
 }
 
+// Describes a crash or fatal error in sourcekitd's work on this thread, which
+// crash recovery returned retCode for; returns sourcekitd's new status.
+int recoveryStatus(int retCode, char *description, size_t size) {
+  if (retCode > 128) {
+    // A signal (CrashRecoveryContext returns 128 + the signal number).
+    int signal = retCode - 128;
+    std::snprintf(description, size,
+                  "sourcekitd stopped: recovered crash (signal %d)", signal);
+    return signal;
+  }
+  // report_fatal_error (through the router) or another exit path.
+  if (tFatalReason[0])
+    std::snprintf(description, size,
+                  "sourcekitd stopped: recovered fatal error (%s)",
+                  tFatalReason);
+  else
+    std::snprintf(description, size,
+                  "sourcekitd stopped: recovered fatal error (exit status %d)",
+                  retCode);
+  return SWIFTHOST_SOURCEKITD_FATAL_ERROR;
+}
+
+// The app's code that sourcekitd calls while one of its work items runs under
+// crash recovery on this thread (response receivers, the notification
+// handler): the work item calls it once it has left crash recovery, so that a
+// crash in the app's code is not taken for one in sourcekitd's, and the
+// recovery never skips the app's destructors or leaves its locks held.
+thread_local std::vector<std::function<void()>> *tAppCalls = nullptr;
+
+void callApp(std::function<void()> call) {
+  if (tAppCalls) {
+    tAppCalls->push_back(std::move(call));
+    return;
+  }
+  call();
+}
+
 // Runs fn, a piece of sourcekitd's work, under crash recovery on the calling
 // thread (with an alternate signal stack, so that a stack overflow is
-// recovered too); a crash or fatal error stops sourcekitd.
+// recovered too); a crash or fatal error stops sourcekitd. Then calls the app
+// code that fn produced (callApp), outside crash recovery.
 template <typename Fn> void runSourceKitProtected(Fn fn) {
   // A thread that is already under crash recovery: that recovery covers it.
   if (llvm::CrashRecoveryContext::GetCurrent()) {
     fn();
     return;
   }
-  ThreadRoleScope roleScope(ThreadRole::SourceKit, -1);
-  AlternateSignalStack altStack;
-  CrashRecoveryUse recovery;
-  const void *stackState = llvm::SavePrettyStackState();
-  tFatalReason[0] = '\0';
-  llvm::CrashRecoveryContext crc;
-  if (crc.RunSafely(fn))
-    return;
-  llvm::RestorePrettyStackState(stackState);
-  gSourceKitRecoveries.fetch_add(1, std::memory_order_release);
+  std::vector<std::function<void()>> appCalls;
+  int status = 0;
   char description[400];
-  int status;
-  if (crc.RetCode > 128) {
-    // A signal (CrashRecoveryContext returns 128 + the signal number).
-    status = crc.RetCode - 128;
-    std::snprintf(description, sizeof(description),
-                  "sourcekitd stopped: recovered crash (signal %d)", status);
-  } else {
-    // report_fatal_error (through the router) or another exit path.
-    status = SWIFTHOST_SOURCEKITD_FATAL_ERROR;
-    if (tFatalReason[0])
-      std::snprintf(description, sizeof(description),
-                    "sourcekitd stopped: recovered fatal error (%s)",
-                    tFatalReason);
-    else
-      std::snprintf(description, sizeof(description),
-                    "sourcekitd stopped: recovered fatal error (exit status %d)",
-                    crc.RetCode);
+  {
+    ThreadRoleScope roleScope(ThreadRole::SourceKit, -1);
+    AlternateSignalStack altStack;
+    CrashRecoveryUse recovery;
+    const void *stackState = llvm::SavePrettyStackState();
+    tFatalReason[0] = '\0';
+    llvm::CrashRecoveryContext crc;
+    tAppCalls = &appCalls;
+    tSourceKitRecovery = &crc;
+    tSourceKitRecoveryBooked = false;
+    bool completed = crc.RunSafely(fn);
+    tSourceKitRecovery = nullptr;
+    tAppCalls = nullptr;
+    if (!completed) {
+      if (tSourceKitRecoveryBooked) {
+        if (unsigned delay = gTestRecoveryDelayMs.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        gSourceKitRecoveriesEnded.fetch_add(1, std::memory_order_seq_cst);
+      }
+      llvm::RestorePrettyStackState(stackState);
+      status = recoveryStatus(crc.RetCode, description, sizeof(description));
+    }
   }
-  stopSourceKit(status, description);
+  if (status)
+    stopSourceKit(status, description);
+  // A crash may have hit while a call was being added.
+  for (auto &call : appCalls)
+    if (call)
+      call();
 }
 
 // WorkQueue's execution hook: every asynchronous and every stack-deep work
@@ -606,17 +757,23 @@ void sendRequest(sourcekitd_object_t, bool synchronous,
     answerStopped(std::move(request->receiver), synchronous);
     return;
   }
+  // The receiver is the app's (for a synchronous request sourcekitd's own,
+  // which wakes the caller). The request counts as answered only when it is
+  // called: if the work item that produced the response crashes or never
+  // ends, stopping sourcekitd answers the request instead.
   ResponseReceiver tracked = [request](sourcekitd_response_t response) {
-    // Already answered with the error of the stopped service.
-    if (request->answered.exchange(true)) {
-      sourcekitd_response_dispose(response);
-      return;
-    }
-    {
-      std::lock_guard<std::mutex> lock(gSourceKitLock);
-      gPendingRequests.erase(request);
-    }
-    request->receiver(response);
+    callApp([request, response] {
+      // Already answered with the error of the stopped service.
+      if (request->answered.exchange(true)) {
+        sourcekitd_response_dispose(response);
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(gSourceKitLock);
+        gPendingRequests.erase(request);
+      }
+      request->receiver(response);
+    });
   };
   if (!synchronous) {
     // Only dispatches the request to sourcekitd's queue.
@@ -637,9 +794,14 @@ bool shouldUseService() {
   return gSourceKitStatus.load(std::memory_order_acquire) == 0;
 }
 
-// sourcekitd_initialize installs a fatal error handler that aborts; the
-// router replaces it.
-void serviceInitialized() { installFatalErrorRouter(); }
+// sourcekitd_initialize keeps the router (it would install a fatal error
+// handler that aborts).
+bool shouldInstallFatalErrorHandler() { return false; }
+
+// The notification handler is the app's code.
+void deliverNotification(std::function<void()> deliver) {
+  callApp(std::move(deliver));
+}
 
 // Installs the hooks before anything can call into sourcekitd.
 struct SourceKitHooksRegistration {
@@ -648,7 +810,8 @@ struct SourceKitHooksRegistration {
     sourcekitdInProc::ServiceHooks hooks;
     hooks.SendRequest = sendRequest;
     hooks.ShouldUseService = shouldUseService;
-    hooks.ServiceInitialized = serviceInitialized;
+    hooks.ShouldInstallFatalErrorHandler = shouldInstallFatalErrorHandler;
+    hooks.DeliverNotification = deliverNotification;
     sourcekitdInProc::setServiceHooks(hooks);
   }
 } gSourceKitHooksRegistration;
