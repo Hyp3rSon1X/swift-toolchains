@@ -1,0 +1,11 @@
+# Opens errors.swift as an editor document (semantic diagnostics are fetched
+# with diagnostics.yaml, which reads the document's text from the editor).
+{
+  key.request: source.request.editor.open,
+  key.name: "${WORK}/errors.swift",
+  key.sourcefile: "${WORK}/errors.swift",
+  key.sourcetext: "let xs = [1, 2, 3]\nlet n: Int = \"one\"\nprint(xs, n)\n",
+  key.enablesyntaxmap: 0,
+  key.enablesubstructure: 0,
+  key.compilerargs: [${ARGS:errors.swift}]
+}

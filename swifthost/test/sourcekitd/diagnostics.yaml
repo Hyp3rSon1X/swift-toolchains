@@ -1,0 +1,6 @@
+# Semantic diagnostics of the open editor document errors.swift.
+{
+  key.request: source.request.diagnostics,
+  key.sourcefile: "${WORK}/errors.swift",
+  key.compilerargs: [${ARGS:errors.swift}]
+}

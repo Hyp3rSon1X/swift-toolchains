@@ -1,0 +1,8 @@
+# Code completion after `xs.` (offset 22 is right behind the dot).
+{
+  key.request: source.request.codecomplete,
+  key.sourcefile: "${WORK}/complete.swift",
+  key.sourcetext: "let xs = [1, 2, 3]\nxs.\n",
+  key.offset: 22,
+  key.compilerargs: [${ARGS:complete.swift}]
+}
