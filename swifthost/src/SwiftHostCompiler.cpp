@@ -360,6 +360,10 @@ public:
       return;
     stack_t restore = previous;
     restore.ss_flags &= SS_DISABLE;
+    // Darwin rejects a size below MINSIGSTKSZ even to disable the stack
+    // (ENOMEM), which would leave this one installed.
+    if ((restore.ss_flags & SS_DISABLE) && restore.ss_size < MINSIGSTKSZ)
+      restore.ss_size = MINSIGSTKSZ;
     // If the kernel still considers the thread to be on this stack, keep the
     // memory rather than unmap a stack that may still be used.
     if (sigaltstack(&restore, nullptr) == 0)
