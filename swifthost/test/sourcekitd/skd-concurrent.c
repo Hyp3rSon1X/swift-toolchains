@@ -145,6 +145,7 @@ static void *prober_main(void *arg) {
     iter_t it;
     uint64_t sig = run_iteration(p->cfg, p->steps, 0, &it);
     p->iterations++;
+    if (!p->baseline) p->baseline = sig; // no phase 1: the first iteration is the reference
     char line[700];
     snprintf(line, sizeof line, "iteration %d: %d steps, signature %016llx (%s)%s%s", p->iterations, it.steps,
              (unsigned long long)sig, sig == p->baseline ? "same as alone" : "DIFFERENT from alone",
@@ -168,7 +169,7 @@ static int ends_with(const char *s, const char *suffix) {
 int main(int argc, char **argv) {
   skd_probe_config cfg;
   skd_probe_config_init(&cfg);
-  const char *files[4096], *fe_args_file = NULL, *object = NULL, *workdir = NULL, *module_dir = NULL;
+  const char *phases = "pcx", *files[4096], *fe_args_file = NULL, *object = NULL, *workdir = NULL, *module_dir = NULL;
   size_t nfiles = 0;
   for (int i = 1; i < argc; i++) {
     const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -186,6 +187,7 @@ int main(int argc, char **argv) {
     else if (OPT("--frontend-args")) fe_args_file = v;
     else if (OPT("--object")) object = v;
     else if (OPT("--workdir")) workdir = v;
+    else if (OPT("--phases")) phases = v;
     else { fprintf(stderr, "unknown or incomplete option %s\n", a); return 2; }
   }
   if (module_dir) {
@@ -232,26 +234,32 @@ int main(int argc, char **argv) {
   printf("%s\n", swifthost_version());
 
   // phase 1: probe alone
-  {
+  iter_t alone = {0};
+  uint64_t baseline = 0;
+  char line[700];
+  if (strchr(phases, 'p')) {
     skd_probe_config c = cfg;
     c.steps = "init";
     iter_t it;
     run_iteration(&c, "init", 0, &it);
-  }
-  iter_t alone;
   double t0 = now_ms();
-  uint64_t baseline = run_iteration(&cfg, iter_steps, 1, &alone);
-  char line[700];
+  baseline = run_iteration(&cfg, iter_steps, 1, &alone);
   snprintf(line, sizeof line, "probe alone: %d steps in %.0f ms, signature %016llx%s%s", alone.steps, now_ms() - t0,
            (unsigned long long)baseline, alone.first_bad[0] ? " FAILING: " : "", alone.first_bad);
   say("B", line);
+  }
 
   // phase 2: compile alone
   compile_t c1 = {.argv = fe_argv, .argc = fe_argc, .err_path = err_path, .object = object};
+  if (strchr(phases, 'c'))
   run_compile_thread(&c1);
+  if (strchr(phases, 'c')) {
   snprintf(line, sizeof line, "compile alone: rc=%d %.0f ms object=%ld bytes hash=%016llx stderr=%ld bytes hash=%016llx",
            c1.rc, c1.ms, c1.obj_size, (unsigned long long)c1.obj_hash, c1.err_size, (unsigned long long)c1.err_hash);
   say("A", line);
+  }
+  if (!strchr(phases, 'x'))
+    return 0;
 
   // phase 3: both
   atomic_int stop = 0;
