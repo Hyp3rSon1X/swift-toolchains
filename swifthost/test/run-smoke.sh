@@ -6,8 +6,8 @@
 #
 # <lib> is a slice's libSwiftHostCompiler.a (or the prelinked SwiftHostCompiler.o).
 # <sdk-target-dir> is .../swift-6.4.2-RELEASE_wasm.artifactbundle/swift-6.4.2-RELEASE_wasm/wasm32-unknown-wasip1.
-# <iwasm> is a macOS WAMR iwasm. The simulator run creates a temporary simulator device, runs the test in it, deletes
-# the device, and then runs the produced modules in iwasm on the host.
+# <iwasm> is a macOS WAMR iwasm. The simulator run creates a temporary simulator device (named swifthost-smoke-<pid>,
+# deleted on exit; see sim-device.sh), runs the test in it, and then runs the produced modules in iwasm on the host.
 # After the main run, each crash mode of smoke.c runs in a process of its own (each ends with the library poisoned),
 # then the macro modes: plugin-handler (the app's own plugin message handler) and exec-plugin (executable plugins,
 # run with test/nospawn.c inserted, which aborts on any process creation and logs it).
@@ -55,25 +55,10 @@ if [[ $SLICE == macosx ]]; then
   exit $rc
 fi
 
-# An iOS runtime and an iPhone device type for it: among the available runtimes that support more than one
-# iPhone (some runtimes support a single device, and simctl create rejects others), the newest version, and
-# among those the one that supports the most device types.
-read -r RUNTIME DEVTYPE < <(xcrun simctl list runtimes -j | python3 -I -c '
-import json, sys
-iphones = lambda r: [d["identifier"] for d in r.get("supportedDeviceTypes", []) if d["name"].startswith("iPhone")]
-rs = [r for r in json.load(sys.stdin)["runtimes"] if r["platform"] == "iOS" and r["isAvailable"] and len(iphones(r)) > 1]
-if not rs:
-    sys.exit("no available iOS simulator runtime that supports iPhones")
-r = max(rs, key=lambda r: ([int(x) for x in r["version"].split(".")], len(r["supportedDeviceTypes"])))
-print(r["identifier"], iphones(r)[0])') || true
-if [[ -z ${RUNTIME:-} || -z ${DEVTYPE:-} ]]; then
-  echo "no usable iOS simulator runtime" >&2
-  exit 2
-fi
-UDID=$(xcrun simctl create swifthost-smoke "$DEVTYPE" "$RUNTIME")
-trap 'xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true; xcrun simctl delete "$UDID" || true' EXIT
-xcrun simctl boot "$UDID"
-xcrun simctl bootstatus "$UDID" >/dev/null
+# A temporary iPhone device of the newest iOS runtime, deleted again when this script exits (sim-device.sh).
+. "$HERE/sim-device.sh"
+sim_device_create swifthost-smoke || exit 2
+UDID=$SIM_UDID
 rc=0
 xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" "$WORK/run" - "$HERE" || rc=$?
 for mode in $MODES; do

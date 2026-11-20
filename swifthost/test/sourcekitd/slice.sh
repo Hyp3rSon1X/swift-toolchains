@@ -17,31 +17,13 @@ TOOLCHAIN_LIB=$(dirname "$(dirname "$(xcrun -f swiftc)")")/lib/swift/$SLICE
 # SLICE_LINK_EXTRA: extra objects or flags for the link line of the test binaries (word-split), empty by default.
 SLICE_LINK_EXTRA=${SLICE_LINK_EXTRA:-}
 
-SLICE_UDID=
-slice_device_cleanup() {
-  [ -n "$SLICE_UDID" ] || return 0
-  xcrun simctl shutdown "$SLICE_UDID" >/dev/null 2>&1 || true
-  xcrun simctl delete "$SLICE_UDID" >/dev/null 2>&1 || true
-}
-# Same runtime choice as test/run-smoke.sh: among the available iOS runtimes that support more than one iPhone (some
-# support a single device, and simctl create rejects others), the newest version, then the one with the most device types.
+# The device (named swifthost-skd-test-<pid>) comes from ../sim-device.sh, which also deletes it on HUP, INT and TERM
+# and deletes devices that killed runs left behind.
+. "$(dirname "${BASH_SOURCE[0]}")/../sim-device.sh"
 slice_device() {
-  [ "$SLICE" = iphonesimulator ] && [ -z "$SLICE_UDID" ] || return 0
-  local runtime devtype
-  read -r runtime devtype < <(xcrun simctl list runtimes -j | python3 -I -c '
-import json, sys
-iphones = lambda r: [d["identifier"] for d in r.get("supportedDeviceTypes", []) if d["name"].startswith("iPhone")]
-rs = [r for r in json.load(sys.stdin)["runtimes"] if r["platform"] == "iOS" and r["isAvailable"] and len(iphones(r)) > 1]
-if not rs:
-    sys.exit("no available iOS simulator runtime that supports iPhones")
-r = max(rs, key=lambda r: ([int(x) for x in r["version"].split(".")], len(r["supportedDeviceTypes"])))
-print(r["identifier"], iphones(r)[0])') || true
-  if [ -z "${runtime:-}" ] || [ -z "${devtype:-}" ]; then echo "no usable iOS simulator runtime" >&2; exit 2; fi
-  trap slice_device_cleanup EXIT
-  SLICE_UDID=$(xcrun simctl create swifthost-skd-test "$devtype" "$runtime") || exit 2
-  xcrun simctl boot "$SLICE_UDID" && xcrun simctl bootstatus "$SLICE_UDID" >/dev/null || exit 2
-  echo "simulator device: $runtime $devtype" >&2
+  [ "$SLICE" = iphonesimulator ] && [ -z "$SIM_UDID" ] || return 0
+  sim_device_create swifthost-skd-test || exit 2
 }
 slice_run() {
-  if [ "$SLICE" = macosx ]; then "$@"; else slice_device; xcrun simctl spawn "$SLICE_UDID" "$@"; fi
+  if [ "$SLICE" = macosx ]; then "$@"; else slice_device; xcrun simctl spawn "$SIM_UDID" "$@"; fi
 }
