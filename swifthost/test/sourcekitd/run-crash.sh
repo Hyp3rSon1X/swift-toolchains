@@ -1,6 +1,7 @@
 #!/bin/bash
 # Crash containment and coexistence test of the in-process sourcekitd (skd-crash.c), macOS: builds
-# skd-crash against a SwiftHostCompiler.o built with SOURCEKIT=1, prepares its inputs and runs every
+# skd-crash against a SwiftHostCompiler.o built with SOURCEKIT=1 (SLICE=iphonesimulator: the simulator slice, run in a
+# temporary simulator device; see slice.sh), prepares its inputs and runs every
 # mode in a process of its own. Prints one row per mode; exit status 0 when every mode passed. The
 # receiver-crash and notification-crash modes pass when their process ends with SIGTRAP from the app's
 # code, outside the library's crash recovery.
@@ -15,20 +16,19 @@ set -uo pipefail
 LIB=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 SDK=$2 WORK=$(mkdir -p "$3" && cd "$3" && pwd) LONG=${4:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/slice.sh"
 SRC=$(cd "${SRC:-src}" && pwd)
 INC=$(cd "$HERE/../../include" && pwd)
 SKD_INC=$SRC/swift/tools/SourceKit/tools/sourcekitd/include
-SYSROOT=$(xcrun --sdk macosx --show-sdk-path)
-TOOLCHAIN=$(dirname "$(dirname "$(xcrun -f swiftc)")")
 MC=$WORK/mc
 mkdir -p "$MC" "$WORK/in"
 
-xcrun clang -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" -I"$SKD_INC" -I"$INC" -fblocks -O1 -Wall -Wextra \
+xcrun clang -target $TRIPLE -isysroot "$SYSROOT" -I"$SKD_INC" -I"$INC" -fblocks -O1 -Wall -Wextra \
   -c "$HERE/skd-crash.c" -o "$WORK/skd-crash.o" || exit 2
-xcrun clang -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" -O1 -c "$HERE/../plugin-server.c" \
+xcrun clang -target $TRIPLE -isysroot "$SYSROOT" -O1 -c "$HERE/../plugin-server.c" \
   -o "$WORK/plugin-server.o" || exit 2
-xcrun clang++ -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" "$WORK/skd-crash.o" "$WORK/plugin-server.o" \
-  "$LIB" -L"$SYSROOT/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/macosx" -dead_strip -o "$WORK/skd-crash" || exit 2
+xcrun clang++ -target $TRIPLE -isysroot "$SYSROOT" "$WORK/skd-crash.o" "$WORK/plugin-server.o" \
+  "$LIB" $SLICE_LINK_EXTRA -L"$SYSROOT/usr/lib/swift" -L"$TOOLCHAIN_LIB" -dead_strip -o "$WORK/skd-crash" || exit 2
 
 # Completion crashers that still crash Swift 6.4.2 in a release build (SIGSEGV): their #^^# token is
 # the completion point.
@@ -87,7 +87,7 @@ bad=0
 run() { # <mode> <options...>
   local mode=$1; shift
   local t0=$SECONDS
-  "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
+  slice_run "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
   local rc=$? pass fail
   pass=$(grep -c '^PASS ' "$WORK/$mode.log") fail=$(grep -c '^FAIL ' "$WORK/$mode.log")
   printf '%-18s exit=%-3s checks: %2d pass, %d fail (%ds)\n' "$mode" "$rc" "$pass" "$fail" $((SECONDS - t0))
@@ -96,7 +96,7 @@ run() { # <mode> <options...>
 run_dies() { # <mode>
   local mode=$1; shift
   local t0=$SECONDS
-  "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
+  slice_run "$WORK/skd-crash" "$mode" "${common[@]}" --work "$WORK/$mode" "$@" > "$WORK/$mode.log" 2>&1
   local rc=$? outside
   outside=$(grep -c '^TRAP .* outside ' "$WORK/$mode.log")
   printf '%-18s exit=%-3s trap outside crash recovery: %s (%ds)\n' "$mode" "$rc" "$outside" $((SECONDS - t0))

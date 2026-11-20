@@ -6,11 +6,13 @@
 #
 #   run-smoke.sh <skd-probe binary> <sdk-target-dir> <work-dir> <wasm-threads-sdk dir>
 #
-# <wasm-threads-sdk dir> is swifthost/wasm-threads-sdk (test/p*.swift, tailcall/test/*.swift).
+# <skd-probe binary> is built for $SLICE (macosx by default; SLICE=iphonesimulator runs it in a simulator device, see
+# slice.sh), e.g. by run-probe.sh. <wasm-threads-sdk dir> is swifthost/wasm-threads-sdk (test/p*.swift, tailcall/test/*.swift).
 # Writes <work-dir>/logs/<name>.log and prints one table row per source.
 set -uo pipefail
 PROBE=$1 SDK=$2 WORK=$(mkdir -p "$3" && cd "$3" && pwd) TREE=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/slice.sh"
 LOGS=$WORK/logs BROKEN=$WORK/broken
 mkdir -p "$LOGS" "$BROKEN" "$WORK/mc"
 T=$TREE/test TC=$TREE/tailcall/test
@@ -26,7 +28,7 @@ row() { # <name> <diag-expect or ""> <primary> <extra files...> -- <probe option
   local args=(--yaml-dir "$HERE" --sdk "$SDK" --mc "$WORK/mc" --extra-arg -parse-as-library --primary "$primary")
   for f in "${files[@]}"; do args+=(--file "$f"); done
   [ -n "$dexp" ] && args+=(--diag-expect "$dexp")
-  "$PROBE" "${args[@]}" --steps init,open,diag,cursor,complete,close,shutdown "$@" > "$LOGS/$name.log" 2>&1
+  slice_run "$PROBE" "${args[@]}" --steps init,open,diag,cursor,complete,close,shutdown "$@" > "$LOGS/$name.log" 2>&1
   local d c u; d=$(check "$LOGS/$name.log" diag); c=$(check "$LOGS/$name.log" complete); u=$(check "$LOGS/$name.log" cursor)
   printf '%-28s diag=%-5s complete=%-5s cursor=%-5s\n' "$name" "$d" "$c" "$u"
   rows=$((rows+1)); case "$d$c$u" in *FAIL*|*-*) bad=$((bad+1));; esac
