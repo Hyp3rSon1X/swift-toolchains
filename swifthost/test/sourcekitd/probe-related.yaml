@@ -1,0 +1,7 @@
+# Related identifiers (same-file references) at byte ${OFFSET} of the open editor document ${FILE}.
+{
+  key.request: source.request.relatedidents,
+  key.sourcefile: "${FILE}",
+  key.offset: ${OFFSET},
+  key.compilerargs: [${ARGS}]
+}

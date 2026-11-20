@@ -1,0 +1,5 @@
+# editor.close of the document ${FILE}; drops its cached AST and snapshots.
+{
+  key.request: source.request.editor.close,
+  key.name: "${FILE}"
+}

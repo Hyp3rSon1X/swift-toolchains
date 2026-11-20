@@ -1,0 +1,6 @@
+# Semantic diagnostics of the open editor document ${FILE} (reads its current text from the editor).
+{
+  key.request: source.request.diagnostics,
+  key.sourcefile: "${FILE}",
+  key.compilerargs: [${ARGS}]
+}

@@ -1,0 +1,7 @@
+# Cursor info at byte ${OFFSET} of the open editor document ${FILE}.
+{
+  key.request: source.request.cursorinfo,
+  key.sourcefile: "${FILE}",
+  key.offset: ${OFFSET},
+  key.compilerargs: [${ARGS}]
+}

@@ -1,0 +1,10 @@
+# Completion session: open at byte ${OFFSET} of ${FILE}; ${LIMIT} caps the result count.
+{
+  key.request: source.request.codecomplete.open,
+  key.name: "${FILE}",
+  key.sourcefile: "${FILE}",
+  key.sourcetext: "${TEXT}",
+  key.offset: ${OFFSET},
+  key.codecomplete.options: { key.codecomplete.requestlimit: ${LIMIT} },
+  key.compilerargs: [${ARGS}]
+}

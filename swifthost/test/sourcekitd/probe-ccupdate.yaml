@@ -1,0 +1,7 @@
+# Completion session: narrow the open session ${FILE} with the filter text ${FILTER}.
+{
+  key.request: source.request.codecomplete.update,
+  key.name: "${FILE}",
+  key.offset: ${OFFSET},
+  key.codecomplete.options: { key.codecomplete.filtertext: "${FILTER}", key.codecomplete.requestlimit: ${LIMIT} }
+}

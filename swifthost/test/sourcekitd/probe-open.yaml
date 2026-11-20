@@ -1,0 +1,12 @@
+# editor.open of the primary file with its text; syntactic diagnostics come back in the response.
+# Placeholders: ${FILE} ${TEXT} ${ARGS} ${SYNTAXMAP} ${SUBSTRUCTURE} (see skd-probe.c)
+{
+  key.request: source.request.editor.open,
+  key.name: "${FILE}",
+  key.sourcefile: "${FILE}",
+  key.sourcetext: "${TEXT}",
+  key.enablesyntaxmap: ${SYNTAXMAP},
+  key.enablesubstructure: ${SUBSTRUCTURE},
+  key.enablediagnostics: 1,
+  key.compilerargs: [${ARGS}]
+}

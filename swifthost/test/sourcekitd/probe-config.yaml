@@ -1,0 +1,5 @@
+# Global configuration. ${CONFIGKEYS} is empty (reads the current values) or ", key.x: N" pairs for
+# key.completion_max_astcontext_reuse_count (default 100) and key.completion_check_dependency_interval (default 5).
+{
+  key.request: source.request.configuration.global${CONFIGKEYS}
+}

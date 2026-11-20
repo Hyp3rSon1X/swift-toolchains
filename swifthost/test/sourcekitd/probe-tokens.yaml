@@ -1,0 +1,6 @@
+# Semantic tokens of the open editor document ${FILE}.
+{
+  key.request: source.request.semantic_tokens,
+  key.sourcefile: "${FILE}",
+  key.compilerargs: [${ARGS}]
+}

@@ -1,0 +1,6 @@
+# Completion session: close.
+{
+  key.request: source.request.codecomplete.close,
+  key.name: "${FILE}",
+  key.offset: ${OFFSET}
+}

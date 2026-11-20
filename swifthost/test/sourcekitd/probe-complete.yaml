@@ -1,0 +1,8 @@
+# One-shot completion at byte ${OFFSET} of ${FILE} (text sent with the request, no editor document needed).
+{
+  key.request: source.request.codecomplete,
+  key.sourcefile: "${FILE}",
+  key.sourcetext: "${TEXT}",
+  key.offset: ${OFFSET},
+  key.compilerargs: [${ARGS}]
+}

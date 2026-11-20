@@ -1,0 +1,11 @@
+# Replaces ${LENGTH} bytes at ${OFFSET} of the open editor document ${FILE} with ${INSERT}.
+{
+  key.request: source.request.editor.replacetext,
+  key.name: "${FILE}",
+  key.offset: ${OFFSET},
+  key.length: ${LENGTH},
+  key.sourcetext: "${INSERT}",
+  key.enablesyntaxmap: ${SYNTAXMAP},
+  key.enablesubstructure: ${SUBSTRUCTURE},
+  key.enablediagnostics: 1
+}
