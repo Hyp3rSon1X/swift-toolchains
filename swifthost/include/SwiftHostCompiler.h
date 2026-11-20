@@ -32,9 +32,11 @@
  *   call and no such work item runs any more, which restores the handlers
  *   that were installed when the first of them began (a handler installed by
  *   someone else in between is replaced). In builds with SourceKit a small
- *   handler of the library's runs in front of LLVM's (it notes whether the
- *   crash is in sourcekitd's work, then calls LLVM's); it is removed with
- *   LLVM's. For the duration of each call the calling thread also gets an
+ *   handler of the library's runs directly in front of LLVM's (it notes
+ *   whether the crash is in sourcekitd's work, then calls LLVM's); it is only
+ *   ever put over LLVM's own handler, never over one that someone else
+ *   installed while crash recovery was enabled, and is removed with LLVM's.
+ *   For the duration of each call the calling thread also gets an
  *   alternate signal stack of the library's own; the thread's previous
  *   alternate stack setting is restored before the call returns.
  * - A crash or fatal error inside a call is recovered: on the calling thread
@@ -153,7 +155,17 @@
  *   ends while such a recovery is in progress waits for it (it takes
  *   microseconds; after 5 seconds the call stops waiting and may be
  *   poisoned). Other exits through LLVM's exit path in sourcekitd's work are
- *   not attributed and poison a frontend call that runs meanwhile.
+ *   not attributed and poison a frontend call that runs meanwhile, as does a
+ *   crash that a signal handler of the app's (installed while crash recovery
+ *   was enabled) passes straight on to LLVM's handler. A fault that such a
+ *   handler deals with itself is not a recovery and affects nothing.
+ * - SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS is a test hook of the library's
+ *   own tests (read once, at the first frontend call or sourcekitd use). Never
+ *   set it in production: it holds every recovered crash in sourcekitd's work
+ *   for that many milliseconds before the recovery ends (delaying the stop of
+ *   sourcekitd and the error responses), and stalls frontend
+ *   calls meanwhile (up to 5 seconds each at their start and end, after which
+ *   they may be poisoned).
  * - Not recovered (the process ends as without the library): a crash on a
  *   compiler helper thread that sourcekitd's work starts (clang module
  *   builds and module interface builds recover crashes themselves and turn
@@ -170,7 +182,11 @@
  *   (see swifthost_plugin_message_handler). A crash
  *   that a compiler helper thread recovers during a frontend call poisons
  *   the library even when it was sourcekitd's helper thread (the two cannot
- *   be told apart).
+ *   be told apart). Calls into the app's receivers are held until the work
+ *   item that produced them ends: if that work item crashes later on, a
+ *   response it had already finished is dropped and the request gets the
+ *   stop error instead. Notifications that were already queued are still
+ *   delivered to the notification handler after sourcekitd stopped.
  */
 #ifndef SWIFTHOSTCOMPILER_H
 #define SWIFTHOSTCOMPILER_H

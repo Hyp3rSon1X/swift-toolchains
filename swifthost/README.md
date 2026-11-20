@@ -179,7 +179,14 @@ contract. In short:
   convenient point after a recovered crash.
 - The app's response receivers and notification handler run outside the library's crash recovery: a crash there is
   the app's and ends the process. The app's plugin message handler runs inside sourcekitd's work: a crash there
-  stops sourcekitd.
+  stops sourcekitd. Calls into the app's receivers are held until the work item that produced them ends: if that
+  work item crashes later on, a response it had already finished is dropped and the request gets the stop error
+  instead. Notifications that were already queued are still delivered after sourcekitd stopped.
+- The library's attribution handler sits only directly over LLVM's crash recovery handler. A signal handler the app
+  installs while crash recovery is enabled is left alone; a fault it deals with itself affects nothing.
+- `SWIFTHOST_TEST_SOURCEKIT_RECOVERY_DELAY_MS` is a hook for the library's own tests. Never set it in production:
+  it delays the stop after a recovered crash and stalls frontend calls (up to 5 s at their start and end each, after
+  which they may be poisoned).
 - Every `swifthost_wasm_ld` call resets LLVM's process-wide options while sourcekitd may read them; do not pass
   `-Xllvm`/`-mllvm` while sourcekitd is in use.
 
