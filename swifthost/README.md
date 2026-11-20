@@ -130,6 +130,16 @@ awaits still overflow the stack.
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
 
+## Changes in swifthost-6.4.2-4
+
+- The object is built with `SOURCEKIT=1`: sourcekitd's C API (191 entry points of `sourcekitd.h`, in-process, no XPC)
+  is exported next to the seven `swifthost_*` functions (198 exports per slice), with crash containment and
+  `swifthost_sourcekitd_status()` (see "In-process sourcekitd" below and in the header). The library is about 3.4 MB
+  larger per slice.
+- New frontend flag `-platform-condition-os <value>`: it overrides only the value that `os()` checks.
+- The nine swift fork commits since `-3` are listed under Source and patches. The llvm-project branch, swift-syntax,
+  the compiler's behavior without these changes, `JOBS.txt` and the built-in macro module are the same as in `-3`.
+
 ## Changes in swifthost-6.4.2-3
 
 - WebAssembly tail calls for async code with `-Xcc -mtail-call` (see above): four upstream changes, three in
@@ -214,7 +224,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `003c49d77af014861dcbc21613357dd5b33f04a1` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `043f6938c4b458b2f4e6becbea623d5ecd8846e2` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -257,9 +267,9 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
     crash recovery).
   - `[sourcekitd]` (`6c805f13653`) `sourcekitdInProc::setServiceHooks()`: the host interposes on requests and can
     turn the service off after a crash.
-  - `[sourcekitd]` (`39319987fc5`) `ServiceHooks::DeliverNotification`: the host calls the notification handler
+  - `[sourcekitd]` (`29649a8d637`) `ServiceHooks::DeliverNotification`: the host calls the notification handler
     (outside its crash recovery).
-  - `[sourcekitd]` (`003c49d77af`) `ServiceHooks::ShouldInstallFatalErrorHandler`: `sourcekitd_initialize` keeps the
+  - `[sourcekitd]` (`043f6938c4b`) `ServiceHooks::ShouldInstallFatalErrorHandler`: `sourcekitd_initialize` keeps the
     host's LLVM fatal error handler.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
