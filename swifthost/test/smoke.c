@@ -29,10 +29,12 @@
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -148,6 +150,17 @@ static void addFrontendCommon(Args *a, const char *obj) {
   add(a, "-no-auto-bridging-header-chaining");
   add(a, "-module-name"); add(a, "main");
   add(a, "-o"); add(a, obj);
+}
+
+/* Whether diag holds exactly one diagnostic, "error: compilation cancelled", as a cancelled call must (see the
+   header). A diagnostic with a location and source excerpt repeats its kind in the excerpt, so it counts twice. */
+static int onlyCancellation(const char *diag) {
+  static const char *const kinds[] = {"error: ", "warning: ", "note: ", "remark: "};
+  int n = 0;
+  for (size_t i = 0; diag && i < sizeof kinds / sizeof kinds[0]; ++i)
+    for (const char *e = diag; (e = strstr(e, kinds[i])); e += strlen(kinds[i]))
+      ++n;
+  return n == 1 && strstr(diag, "error: compilation cancelled");
 }
 
 typedef struct {
@@ -284,6 +297,41 @@ static void *canceller(void *p) {
   CancelCtx *c = p;
   usleep((useconds_t)c->delayMs * 1000);
   c->requestedAt = nowMs();
+  swifthost_request_cancel();
+  return NULL;
+}
+
+static double threadCpuMs(mach_port_t thread) {
+  thread_basic_info_data_t bi;
+  mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+  if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) != KERN_SUCCESS)
+    return -1;
+  return bi.user_time.seconds * 1e3 + bi.user_time.microseconds / 1e3 +
+         bi.system_time.seconds * 1e3 + bi.system_time.microseconds / 1e3;
+}
+
+/* Cancels the frontend call that is running once the calling thread has used
+   cpuMs of CPU time since the canceller started. On a loaded machine a wall
+   clock delay lands earlier in the compilation (in parsing, which does not
+   stop), so the CPU clock keeps the cancel where it lands on an idle device.
+   Gives up when done is set (the call finished first). Read requestedAt and
+   cpuAtRequest only after joining the canceller; requestedAt stays 0 when it
+   gave up. */
+typedef struct {
+  int cpuMs;
+  mach_port_t thread;
+  atomic_int done;
+  double requestedAt, cpuAtRequest;
+} CpuCancelCtx;
+static void *cpuCanceller(void *p) {
+  CpuCancelCtx *c = p;
+  double start = threadCpuMs(c->thread);
+  while (!atomic_load(&c->done) && threadCpuMs(c->thread) - start < c->cpuMs)
+    usleep(1000);
+  if (atomic_load(&c->done))
+    return NULL;
+  c->requestedAt = nowMs();
+  c->cpuAtRequest = threadCpuMs(c->thread);
   swifthost_request_cancel();
   return NULL;
 }
@@ -619,6 +667,8 @@ static void *worker(void *unused) {
         "cancelled build: rc %d stage %d (expected %d in the frontend)", k.rc, k.stage,
         SWIFTHOST_ECANCELED);
   CHECK(latency < 2000, "cancel took %.0f ms", latency);
+  CHECK(k.rc != SWIFTHOST_ECANCELED || onlyCancellation(k.diag),
+        "cancelled build: diagnostics other than \"compilation cancelled\":\n%s", k.diag);
 
   /* Function bodies are type checked after the top-level declarations; a
      cancel lands among them. */
@@ -634,6 +684,48 @@ static void *worker(void *unused) {
         "cancelled function bodies: rc %d stage %d (expected %d in the frontend)", kf.rc,
         kf.stage, SWIFTHOST_ECANCELED);
   CHECK(latency < 2000, "cancel in function bodies took %.0f ms", latency);
+  CHECK(kf.rc != SWIFTHOST_ECANCELED || onlyCancellation(kf.diag),
+        "cancelled function bodies: diagnostics other than \"compilation cancelled\":\n%s", kf.diag);
+
+  /* One function body of 4,000 statements with three closures each, as an
+     app's generator writes it, cancelled after 300 ms of the call's CPU time
+     (type checking the body takes seconds): the type checker stops at the
+     next statement, and the only diagnostic is "compilation cancelled" (with
+     swifthost-6.4.2-4, one error per remaining statement). The bound leaves
+     room for a loaded machine; an idle Mac takes a few tens of
+     milliseconds. */
+  char *body = fmt("%s/body.swift", WORK);
+  FILE *wf = fopen(body, "w");
+  fputs("func work() -> Int {\n    var total = 0\n", wf);
+  for (int i = 0; i < 4000; ++i)
+    fprintf(wf, "    total &+= [%d, %d, %d].map { $0 &* 3 }.filter { $0 > 1 }.reduce(0, &+)\n",
+            i, i + 1, i + 2);
+  fputs("    return total\n}\nprint(work())\n", wf);
+  fclose(wf);
+  const char *swift6[] = {"-swift-version", "6", NULL};
+  CpuCancelCtx wc = {.cpuMs = 300, .thread = pthread_mach_thread_np(pthread_self())};
+  atomic_init(&wc.done, 0);
+  pthread_create(&ct, NULL, cpuCanceller, &wc);
+  Build kw = build(body, "cancelled-one-body", swift6);
+  double returnedAt = nowMs(), cpuAtReturn = threadCpuMs(wc.thread);
+  atomic_store(&wc.done, 1);
+  pthread_join(ct, NULL);
+  /* The canceller may also have fired after the call had returned. */
+  int fired = wc.requestedAt > 0 && wc.requestedAt <= returnedAt;
+  latency = fired ? returnedAt - wc.requestedAt : -1;
+  double latencyCpu = fired ? cpuAtReturn - wc.cpuAtRequest : -1;
+  report("cancelled-one-body", &kw);
+  if (fired)
+    printf("  cancel latency %.0f ms, %.0f ms of CPU (frontend ran %.0f ms)\n", latency, latencyCpu, kw.fe);
+  else
+    printf("  the call returned before the cancel was requested (frontend ran %.0f ms)\n", kw.fe);
+  CHECK(fired, "cancelled long body: the call returned before the cancel was requested");
+  CHECK(kw.rc == SWIFTHOST_ECANCELED && kw.stage == 1,
+        "cancelled long body: rc %d stage %d (expected %d in the frontend)", kw.rc, kw.stage,
+        SWIFTHOST_ECANCELED);
+  CHECK(!fired || latency < 500, "cancel in a long function body took %.0f ms (bound 500 ms)", latency);
+  CHECK(kw.rc != SWIFTHOST_ECANCELED || onlyCancellation(kw.diag),
+        "cancelled long body: diagnostics other than \"compilation cancelled\":\n%s", kw.diag);
 
   Build ak = build(hello, "after-cancel", NULL);
   report("after-cancel", &ak);
