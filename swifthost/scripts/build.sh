@@ -209,6 +209,12 @@ cmd_slice() {
   # exports only the swifthost_* symbols (with SourceKit: and sourcekitd's
   # objects and archives, exporting its C API as well).
   mkdir -p "$O"
+  # With SourceKit the shim also holds sourcekitd's crash containment (SourceKit's work-queue and service hooks).
+  local shimSourceKit=()
+  if [[ $SOURCEKIT == 1 ]]; then
+    shimSourceKit=(-DSWIFTHOST_SOURCEKIT=1 -I"$SRC/swift/tools/SourceKit/include"
+      -I"$SRC/swift/tools/SourceKit/tools/sourcekitd/include" -I"$B/tools/SourceKit/include")
+  fi
   "$CXX" -target $TRIPLE -isysroot "$SYSROOT" -std=c++17 -O2 -g0 -fPIC \
     -fno-exceptions -fno-rtti -funwind-tables -fsized-deallocation -fvisibility-inlines-hidden \
     -DNDEBUG -DCMARK_STATIC_DEFINE -DGTEST_HAS_RTTI=0 -DOBJC_OLD_DISPATCH_PROTOTYPES=0 \
@@ -218,7 +224,7 @@ cmd_slice() {
     -I"$SRC/llvm-project/llvm/include" -I"$L/include" \
     -I"$SRC/llvm-project/clang/include" -I"$L/tools/clang/include" \
     -I"$SRC/llvm-project/lld/include" -I"$L/tools/lld/include" \
-    -Wall -Wno-unused-parameter \
+    ${shimSourceKit[@]+"${shimSourceKit[@]}"} -Wall -Wno-unused-parameter \
     -c "$HERE/src/SwiftHostCompiler.cpp" -o "$O/SwiftHostCompiler-shim.o"
   local archives=() objects=() a
   while read -r a; do
@@ -230,7 +236,7 @@ cmd_slice() {
       ninja -t commands lib/libsourcekitdInProc.dylib | tail -1 | tr ' ' '\n' | grep -E '\.(a|o)$'
   } | awk '!s[$0]++')
   printf '%s\n' _swifthost_version _swifthost_swift_frontend _swifthost_swift_autolink_extract _swifthost_wasm_ld \
-    _swifthost_request_cancel _swifthost_set_plugin_message_handler > "$O/exports.txt"
+    _swifthost_request_cancel _swifthost_set_plugin_message_handler _swifthost_sourcekitd_status > "$O/exports.txt"
   # sourcekitd's C API (the portable list; the -darwin one adds C++ symbols
   # for the XPC service). -u pulls in the archive members that define them.
   local undefined=()

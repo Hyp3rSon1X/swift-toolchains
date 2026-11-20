@@ -27,7 +27,7 @@ SDK. Macros work through an in-process plugin server that the app provides (see 
 
 Each `libSwiftHostCompiler.a` holds one prelinked object: the compiler, clang (as the Swift compiler's C importer),
 LLVM with only the WebAssembly backend, and lld's wasm linker, linked together (`ld -r`) and with every symbol
-hidden except the six `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
+hidden except the seven `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
 cannot clash with it.
 
 ## Linking

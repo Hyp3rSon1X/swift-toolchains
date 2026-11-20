@@ -25,12 +25,13 @@
  *   stderr (not to out_fd/err_fd) and the call poisons the library (see
  *   below; it returns 1, or SWIFTHOST_EPOISONED where LLVM would exit with
  *   0). Pass only -Xllvm options that you have tested.
- * - Crash recovery: around each call the library enables LLVM's
- *   CrashRecoveryContext, which installs process-global handlers for SIGABRT,
- *   SIGBUS, SIGFPE, SIGILL, SIGSEGV and SIGTRAP (with SA_ONSTACK), and
- *   disables it before returning, which restores the handlers that were
- *   installed when the call began (a handler installed by someone else during
- *   the call is replaced). For the duration of each call the calling thread
+ * - Crash recovery: around each call (and each work item of the in-process
+ *   sourcekitd, see below) the library enables LLVM's CrashRecoveryContext,
+ *   which installs process-global handlers for SIGABRT, SIGBUS, SIGFPE,
+ *   SIGILL, SIGSEGV and SIGTRAP (with SA_ONSTACK), and disables it when no
+ *   call and no such work item runs any more, which restores the handlers
+ *   that were installed when the first of them began (a handler installed by
+ *   someone else in between is replaced). For the duration of each call the calling thread
  *   also gets an alternate signal stack of the library's own; the thread's
  *   previous alternate stack setting is restored before the call returns.
  * - A crash or fatal error inside a call is recovered: on the calling thread
@@ -48,15 +49,17 @@
  *   library, when a helper thread overflows its stack (helper threads have
  *   no alternate signal stack) or the crash handler itself overflows the
  *   alternate stack (256 KiB).
- * - A crash on any other thread during a call is not recovered. The handler
- *   turns crash recovery off for the rest of that call (a crash or fatal error
- *   in the call after that ends the process, a fatal error through exit()) and
- *   re-raises the signal with raise() to the handlers that were installed when
- *   the call began (or the default action), so they get it without its original
+ * - A crash on any other thread while a call or sourcekitd's work runs is
+ *   not recovered. The handler turns crash recovery off until the next call
+ *   or sourcekitd work item starts (a crash or fatal error in between ends the
+ *   process, a fatal error through exit()) and re-raises the signal with
+ *   raise() to the handlers that were installed when crash recovery was
+ *   enabled (or the default action), so they get it without its original
  *   details (no fault address; the signal looks sent by raise()). Code that
  *   handles its own faults through signals, for example a WebAssembly runtime
  *   that relies on guard pages, or a crash reporter that needs the fault
- *   address, must not run on another thread while a call is in progress.
+ *   address, must not run on another thread while a call or sourcekitd's
+ *   work is in progress.
  * - No other signal handlers are installed, no process is ever spawned and,
  *   except in the case above, exit() is never called.
  * - The frontend needs -module-cache-path pointing at a writable directory
@@ -77,6 +80,64 @@
  * - Diagnostics use swift-syntax's style, which prints source excerpts under
  *   each "file:line:column: error: ..." line; -diagnostic-style llvm gives
  *   one-line diagnostics as in swifthost-6.4.2-1.
+ * - LLVM fatal errors (report_fatal_error) go to the library's own handler,
+ *   which it installs for the whole process at the first call (or at
+ *   sourcekitd_initialize) and keeps installed: in a frontend or autolink
+ *   call they are reported to its err_fd ("fatal error encountered during
+ *   compilation"), in a wasm-ld call to its err_fd ("fatal error in the
+ *   linker"), on a compiler helper thread or any other thread to stderr
+ *   ("LLVM ERROR: ...").
+ *
+ * In-process sourcekitd (builds with SourceKit, which also export the
+ * sourcekitd_* C API of sourcekitd.h)
+ *
+ * - sourcekitd and the compiler calls share the process and may run at the
+ *   same time: completion keeps answering while a long build runs. LLVM's
+ *   options (-Xllvm, wasm-ld's -mllvm) are process-wide: a call that passes
+ *   them changes them for sourcekitd's work too until the next call, which
+ *   resets them (sourcekitd never sets them). Likewise -print-stats and
+ *   -stats-output-dir turn on LLVM's process-wide statistics, which then also
+ *   count sourcekitd's work.
+ * - Macro expansion inside sourcekitd requests uses the same route as
+ *   frontend calls: the app's handler (swifthost_set_plugin_message_handler)
+ *   or else the server library named by the request's
+ *   -in-process-plugin-server-path.
+ * - Crash containment: sourcekitd's work runs under crash recovery on every
+ *   thread it uses (its request threads, its 8 MiB threads, the main queue
+ *   for notifications), each item with an alternate signal stack of its own,
+ *   so a stack overflow is recovered as well. A synchronous request
+ *   (sourcekitd_send_request_sync) is handled on one of those threads while
+ *   the calling thread waits. A crash or LLVM fatal error in that work stops
+ *   sourcekitd instead of ending the process: the request it happened in, and
+ *   every other request that has not been answered yet, gets an error
+ *   response (sourcekitd_response_is_error, kind
+ *   SOURCEKITD_ERROR_CONNECTION_INTERRUPTED, description "sourcekitd stopped:
+ *   recovered crash (signal N)" or "sourcekitd stopped: recovered fatal error
+ *   (<reason>)"). From then on every sourcekitd_send_request and
+ *   sourcekitd_send_request_sync gets the same error at once (asynchronous
+ *   ones on a global queue) without reaching sourcekitd; sourcekitd_initialize,
+ *   sourcekitd_shutdown, sourcekitd_cancel_request,
+ *   sourcekitd_request_handle_dispose and sourcekitd_set_notification_handler
+ *   do nothing, and queued work is dropped. Threads that were running
+ *   sourcekitd's work at that moment continue until they reach their next
+ *   work item; one blocked on a lock the crashed thread held stays blocked
+ *   (its request has been answered). swifthost_sourcekitd_status() tells
+ *   whether sourcekitd stopped. Frontend calls are not affected and keep
+ *   working under the rules above. Only a process restart starts sourcekitd
+ *   again.
+ * - Not recovered (the process ends as without the library): a crash on a
+ *   compiler helper thread that sourcekitd's work starts (clang module
+ *   builds and module interface builds recover crashes themselves and turn
+ *   them into errors, but a stack overflow there is fatal), a crash in the
+ *   request and response object functions (sourcekitd_request_*,
+ *   sourcekitd_response_*, sourcekitd_variant_*, sourcekitd_uid_*) and in
+ *   the receivers the app passes, which run on the calling thread or are
+ *   called by sourcekitd's work (a crash in a receiver called by that work is
+ *   recovered and stops sourcekitd), a fault inside libdispatch itself, and
+ *   the crash handler overflowing the alternate stack (256 KiB). A crash
+ *   that a compiler helper thread recovers during a frontend call poisons
+ *   the library even when it was sourcekitd's helper thread (the two cannot
+ *   be told apart).
  */
 #ifndef SWIFTHOSTCOMPILER_H
 #define SWIFTHOSTCOMPILER_H
@@ -96,6 +157,10 @@ extern "C" {
 /* Returned by a frontend call that swifthost_request_cancel() stopped. Not an
    error state: later calls work normally. */
 #define SWIFTHOST_ECANCELED 124
+
+/* Returned by swifthost_sourcekitd_status() after an LLVM fatal error (or
+   another exit path) stopped sourcekitd; not a signal number. */
+#define SWIFTHOST_SOURCEKITD_FATAL_ERROR 256
 
 /* Minimum stack size of the thread that calls into the library. */
 #define SWIFTHOST_MIN_STACK_SIZE 16777216u /* 16 MiB; a plain literal so that Swift imports it */
@@ -132,6 +197,12 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    not cancellable (they are short and bounded by their input). */
 void swifthost_request_cancel(void);
 
+/* 0 while the in-process sourcekitd works, otherwise what stopped it: the
+   signal number of the recovered crash (for example 11 for SIGSEGV, 10 for
+   SIGBUS on a stack overflow) or SWIFTHOST_SOURCEKITD_FATAL_ERROR. Always 0 in
+   a build without SourceKit. Callable from any thread; returns immediately. */
+int swifthost_sourcekitd_status(void);
+
 /* Serves one compiler plugin message; the same contract as the
    swift_inproc_plugins_handle_message entry point of an in-process plugin
    server library. message/length: the request (JSON, not NUL-terminated,
@@ -143,18 +214,22 @@ void swifthost_request_cancel(void);
    message. Called during a swifthost_swift_frontend call, usually on the
    calling thread, but also on the compiler's 8 MiB helper thread when the
    call rebuilds a module from its .swiftinterface (that build gets the
-   call's plugin options). A crash in the handler is recovered like a compiler
-   crash on the calling thread (it poisons the library) and ends the process
-   on the helper thread. It must not call into this library. */
+   call's plugin options), and on sourcekitd's threads for macros in
+   sourcekitd requests, possibly at the same time as for a frontend call. A
+   crash in the handler is recovered like a compiler crash on the calling
+   thread (it poisons the library, or stops sourcekitd on its threads) and
+   ends the process on the helper thread. It must not call into this
+   library. */
 typedef bool (*swifthost_plugin_message_handler)(const char *message,
                                                  size_t length,
                                                  char **response,
                                                  size_t *response_length);
 
 /* Makes the compiler pass every plugin message to handler instead of loading
-   an in-process plugin server library. Call it once, before the first
-   swifthost_swift_frontend call: a later call, a second call or a NULL
-   handler does nothing. The handler is process-wide and stays set.
+   an in-process plugin server library, in frontend calls and in sourcekitd
+   requests. Call it once, before the first swifthost_swift_frontend call and
+   before the first sourcekitd request that expands a macro: a later call, a
+   second call or a NULL handler does nothing. The handler is process-wide and stays set.
    -in-process-plugin-server-path is optional with a handler: a path given
    there is never opened and need not exist (without it the compiler makes
    up a default path, also never opened). Macro modules are named with
