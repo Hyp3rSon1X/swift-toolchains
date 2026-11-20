@@ -10,6 +10,7 @@
 #include "sourcekitd/sourcekitd.h"
 
 #include <dispatch/dispatch.h>
+#include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -479,6 +480,45 @@ static void run_step(probe_t *p, const char *name, int index, int *skip_rest_of_
       sourcekitd_shutdown();
     p->initialized = p->opened = p->session_open = 0;
     emit(p, name, index, now_ms() - t0, "ok", -1, "sourcekitd_shutdown");
+    free(sum.p);
+    return;
+  }
+
+  // Memory-release steps. pause: sleeps 2 s (the footprint settles). relief: malloc_zone_pressure_relief on all zones.
+  // pressure: asks the harness to apply memory pressure from outside (creates $SKD_PROBE_SYNC_DIR/req-N, waits up to
+  // 120 s for done-N); skipped without SKD_PROBE_SYNC_DIR.
+  if (!strcmp(name, "pause")) {
+    struct timespec ts = {2, 0};
+    nanosleep(&ts, NULL);
+    emit(p, name, index, 2000, "ok", -1, "slept 2 s");
+    free(sum.p);
+    return;
+  }
+  if (!strcmp(name, "relief")) {
+    double t0 = now_ms();
+    size_t freed = malloc_zone_pressure_relief(NULL, 0);
+    buf_printf(&sum, "malloc_zone_pressure_relief returned %.1f MB", mb(freed));
+    emit(p, name, index, now_ms() - t0, "ok", -1, sum.p);
+    free(sum.p);
+    return;
+  }
+  if (!strcmp(name, "pressure")) {
+    static int n;
+    const char *dir = getenv("SKD_PROBE_SYNC_DIR");
+    if (!dir)
+      SKIP("SKD_PROBE_SYNC_DIR not set");
+    char req[1024], done[1024];
+    snprintf(req, sizeof req, "%s/req-%d", dir, ++n);
+    snprintf(done, sizeof done, "%s/done-%d", dir, n);
+    double t0 = now_ms();
+    FILE *f = fopen(req, "w");
+    if (f)
+      fclose(f);
+    while (access(done, F_OK) && now_ms() - t0 < 120000) {
+      struct timespec ts = {0, 20 * 1000 * 1000};
+      nanosleep(&ts, NULL);
+    }
+    emit(p, name, index, now_ms() - t0, access(done, F_OK) ? "error" : "ok", -1, "pressure applied by the harness");
     free(sum.p);
     return;
   }
