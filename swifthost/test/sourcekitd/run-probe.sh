@@ -22,5 +22,11 @@ for f in skd-probe skd-probe-main; do
 done
 xcrun clang++ -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" "$WORK/skd-probe.o" "$WORK/skd-probe-main.o" "$LIB" \
   -L"$SYSROOT/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/macosx" -dead_strip -o "$WORK/skd-probe"
+# The concurrency probe (sourcekitd and swifthost_swift_frontend in one process) needs the swifthost header.
+INC=$(cd "$HERE/../../include" && pwd)
+xcrun clang -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" -I"$SKD_INC" -I"$HERE" -I"$INC" -fblocks -O1 -Wall -Wextra \
+  -c "$HERE/skd-concurrent.c" -o "$WORK/skd-concurrent.o"
+xcrun clang++ -target arm64-apple-macosx27.0 -isysroot "$SYSROOT" "$WORK/skd-probe.o" "$WORK/skd-concurrent.o" "$LIB" \
+  -L"$SYSROOT/usr/lib/swift" -L"$TOOLCHAIN/lib/swift/macosx" -dead_strip -o "$WORK/skd-concurrent"
 echo "skd-probe binary: $(stat -f %z "$WORK/skd-probe") bytes" >&2
 if [ $# -gt 0 ]; then "$WORK/skd-probe" "$@"; fi
