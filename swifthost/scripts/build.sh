@@ -22,6 +22,9 @@
 #   JOBS     parallel jobs (default: all cores)
 #   VERSION  version label compiled into the compiler and returned by swifthost_version()
 #            (default swifthost-6.4.2-3, whatever id package gets); set it to the release id
+#   SOURCEKIT 1: also build the in-process sourcekitd (the C API of sourcekitd.h, no XPC service)
+#            and prelink it into the same object, which then also exports its 191 C entry points
+#            (default 0: the compiler alone, as released in swifthost-6.4.2-3)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$(mkdir -p "${SRC:-src}" && cd "${SRC:-src}" && pwd)
@@ -29,6 +32,7 @@ BUILD=$(mkdir -p "${BUILD:-build}" && cd "${BUILD:-build}" && pwd)
 NATIVE=${NATIVE:-$BUILD/native/bin}
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
 VERSION=${VERSION:-swifthost-6.4.2-3}
+SOURCEKIT=${SOURCEKIT:-0}
 CC=$(xcrun -f clang)
 CXX=$(xcrun -f clang++)
 
@@ -125,6 +129,20 @@ cmd_slice() {
   # prelinked object); executable plugins are compiled out (no spawning).
   # The plugin server tool stays configured (swift-frontend depends on its
   # in-process library target when swift-syntax is on) but is never built.
+  # SourceKit needs SWIFT_ENABLE_DISPATCH (Darwin uses the system libdispatch;
+  # nothing is built for it). HAVE_XPC_H is preset OFF so that check_include_files
+  # keeps it: sourcekitd then uses its portable in-process API
+  # (sourcekitdAPI-InProc.cpp) instead of libxpc, and no XPC service is configured.
+  # The install components are the defaults without sourcekit-inproc and
+  # sourcekit-xpc-service: installing sourcekit-inproc makes sourcekitdInProc a
+  # framework. Only its objects and archives are used, never the linked library.
+  local sourcekit=(-DSWIFT_BUILD_SOURCEKIT=OFF -DSWIFT_TOOL_SOURCEKIT_BUILD=OFF -DSWIFT_ENABLE_DISPATCH=OFF)
+  if [[ $SOURCEKIT == 1 ]]; then
+    sourcekit=(-DSWIFT_BUILD_SOURCEKIT=ON -DSWIFT_TOOL_SOURCEKIT_BUILD=ON -DSWIFT_ENABLE_DISPATCH=ON \
+      -DHAVE_XPC_H=OFF -DBUILD_SOURCEKIT_XPC_SERVICE=OFF -DSWIFT_ENABLE_SOURCEKIT_TESTS=OFF \
+      -DSOURCEKITD_BUILD_STATIC_INPROC=OFF \
+      "-DSWIFT_INSTALL_COMPONENTS=autolink-driver;compiler;compiler-swift-syntax-lib;clang-builtin-headers;libexec;stdlib;sdk-overlay;static-mirror-lib;swift-syntax-lib;editor-integration;tools;testsuite-tools;toolchain-tools;toolchain-dev-tools;license;swift-remote-mirror;swift-remote-mirror-headers")
+  fi
   if [[ ! -f $B/build.ninja ]]; then
     local deployment=27.0
     [[ $SYS == Darwin ]] || deployment=
@@ -146,15 +164,15 @@ cmd_slice() {
       -DSWIFT_BUILD_STDLIB=OFF -DSWIFT_BUILD_SDK_OVERLAY=OFF -DSWIFT_BUILD_DYNAMIC_STDLIB=OFF \
       -DSWIFT_BUILD_STATIC_STDLIB=OFF -DSWIFT_BUILD_DYNAMIC_SDK_OVERLAY=OFF \
       -DSWIFT_BUILD_STATIC_SDK_OVERLAY=OFF -DSWIFT_BUILD_REMOTE_MIRROR=OFF \
-      -DSWIFT_BUILD_SOURCEKIT=OFF -DSWIFT_INCLUDE_TESTS=OFF -DSWIFT_INCLUDE_TEST_BINARIES=OFF \
+      "${sourcekit[@]}" -DSWIFT_INCLUDE_TESTS=OFF -DSWIFT_INCLUDE_TEST_BINARIES=OFF \
       -DSWIFT_INCLUDE_DOCS=OFF -DSWIFT_BUILD_EXAMPLES=OFF -DSWIFT_BUILD_LIBEXEC=OFF \
       -DSWIFT_BUILD_CLANG_OVERLAYS=OFF -DSWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT=OFF \
-      -DSWIFT_ENABLE_BACKTRACING=OFF -DSWIFT_ENABLE_RUNTIME_MODULE=OFF -DSWIFT_ENABLE_DISPATCH=OFF \
+      -DSWIFT_ENABLE_BACKTRACING=OFF -DSWIFT_ENABLE_RUNTIME_MODULE=OFF \
       -DSWIFT_INCLUDE_TOOLS=ON -DSWIFT_INCLUDE_APINOTES=OFF \
       -DSWIFT_TOOL_COMPLETE_TEST_BUILD=OFF -DSWIFT_TOOL_LIBMOCKPLUGIN_BUILD=OFF \
       -DSWIFT_TOOL_LIBSTATICMIRROR_BUILD=OFF -DSWIFT_TOOL_LIBSWIFTSCAN_BUILD=OFF \
       -DSWIFT_TOOL_LLDB_MODULEIMPORT_TEST_BUILD=OFF -DSWIFT_TOOL_SOURCEKITD_REPL_BUILD=OFF \
-      -DSWIFT_TOOL_SOURCEKITD_TEST_BUILD=OFF -DSWIFT_TOOL_SOURCEKIT_BUILD=OFF \
+      -DSWIFT_TOOL_SOURCEKITD_TEST_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_COMPATIBILITY_SYMBOLS_BUILD=OFF -DSWIFT_TOOL_SWIFT_DEF_TO_STRINGS_CONVERTER_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_DEMANGLE_BUILD=OFF -DSWIFT_TOOL_SWIFT_DEMANGLE_YAMLDUMP_BUILD=OFF \
       -DSWIFT_TOOL_SWIFT_FUNCTION_CALLER_GENERATOR_BUILD=OFF -DSWIFT_TOOL_SWIFT_IDE_TEST_BUILD=OFF \
@@ -170,7 +188,7 @@ cmd_slice() {
   else
     # An existing tree: apply the version label of this run (it is compiled into swifthost_version()).
     # (-S too: with -B alone CMake takes the current directory as the source.)
-    cmake -S "$SRC/swift" -B "$B" -DSWIFT_TOOLCHAIN_VERSION="$VERSION" >/dev/null
+    cmake -S "$SRC/swift" -B "$B" -DSWIFT_TOOLCHAIN_VERSION="$VERSION" "${sourcekit[@]}" >/dev/null
   fi
   # Only the archives on swift-frontend's link line: the executable itself
   # needs host-run tools that a cross build cannot run.
@@ -178,10 +196,18 @@ cmd_slice() {
   while read -r lib; do libs+=("$lib"); done < <(
     awk '/^build bin\/swift-frontend:/{p=1} p{print} p&&!/\$$/{exit}' "$B/build.ninja" |
     tr ' ' '\n' | grep -E '^lib/.*\.a$' | sort -u)
+  # With SourceKit also the objects and archives on the link line of the
+  # in-process sourcekitd library (the library itself is not linked).
+  if [[ $SOURCEKIT == 1 ]]; then
+    while read -r lib; do libs+=("$lib"); done < <(
+      awk '/^build lib\/libsourcekitdInProc\.dylib:/{p=1} p{print} p&&!/\$$/{exit}' "$B/build.ninja" |
+      tr ' ' '\n' | grep -E '^(lib/.*\.a|tools/.*\.o)$' | sort -u)
+  fi
   ninja -C "$B" -j "$JOBS" "${libs[@]}"
 
   # 4. The shim, prelinked with every archive it needs into one object that
-  # exports only the swifthost_* symbols.
+  # exports only the swifthost_* symbols (with SourceKit: and sourcekitd's
+  # objects and archives, exporting its C API as well).
   mkdir -p "$O"
   "$CXX" -target $TRIPLE -isysroot "$SYSROOT" -std=c++17 -O2 -g0 -fPIC \
     -fno-exceptions -fno-rtti -funwind-tables -fsized-deallocation -fvisibility-inlines-hidden \
@@ -194,12 +220,24 @@ cmd_slice() {
     -I"$SRC/llvm-project/lld/include" -I"$L/tools/lld/include" \
     -Wall -Wno-unused-parameter \
     -c "$HERE/src/SwiftHostCompiler.cpp" -o "$O/SwiftHostCompiler-shim.o"
-  local archives=() a
+  local archives=() objects=() a
   while read -r a; do
-    case $a in /*) archives+=("$a");; *) archives+=("$B/$a");; esac
-  done < <(cd "$B" && ninja -t commands bin/swift-frontend | tail -1 | tr ' ' '\n' | grep -E '\.a$' | awk '!s[$0]++')
+    case $a in /*) ;; *) a=$B/$a;; esac
+    case $a in *.o) objects+=("$a");; *) archives+=("$a");; esac
+  done < <(cd "$B" && {
+    ninja -t commands bin/swift-frontend | tail -1 | tr ' ' '\n' | grep -E '\.a$'
+    [[ $SOURCEKIT != 1 ]] ||
+      ninja -t commands lib/libsourcekitdInProc.dylib | tail -1 | tr ' ' '\n' | grep -E '\.(a|o)$'
+  } | awk '!s[$0]++')
   printf '%s\n' _swifthost_version _swifthost_swift_frontend _swifthost_swift_autolink_extract _swifthost_wasm_ld \
     _swifthost_request_cancel _swifthost_set_plugin_message_handler > "$O/exports.txt"
+  # sourcekitd's C API (the portable list; the -darwin one adds C++ symbols
+  # for the XPC service). -u pulls in the archive members that define them.
+  local undefined=()
+  if [[ $SOURCEKIT == 1 ]]; then
+    sed 's/^/_/' "$SRC/swift/tools/SourceKit/tools/sourcekitd/bin/InProc/sourcekitdInProc.exports" >> "$O/exports.txt"
+    while read -r a; do undefined+=(-u "$a"); done < "$O/exports.txt"
+  fi
   archives+=("$L/lib/liblldWasm.a" "$L/lib/liblldCommon.a")
   # Swift libraries built by CMake (swift-syntax, ASTGen, the regex parser)
   # carry autolink entries for themselves (-l_CompilerSwiftSyntax, ...). They
@@ -211,7 +249,8 @@ cmd_slice() {
     ignored+=(-ignore_auto_link_library "${a%.a}")
   done
   xcrun ld -r -arch arm64 -platform_version $PLAT 27.0 "$SDKVER" -exported_symbols_list "$O/exports.txt" \
-    "${ignored[@]}" -o "$O/SwiftHostCompiler.o" "$O/SwiftHostCompiler-shim.o" "${archives[@]}"
+    "${ignored[@]}" ${undefined[@]+"${undefined[@]}"} -o "$O/SwiftHostCompiler.o" "$O/SwiftHostCompiler-shim.o" \
+    ${objects[@]+"${objects[@]}"} "${archives[@]}"
   local exported
   exported=$(xcrun nm -gU "$O/SwiftHostCompiler.o" | awk '{print $3}' | sort | tr '\n' ' ')
   if [[ $exported != "$(sort "$O/exports.txt" | tr '\n' ' ')" ]]; then
