@@ -370,3 +370,6 @@ swifthost/scripts/build.sh package "$VERSION"
 ```
 
 `swifthost/test/smoke.c` is the test the releases pass on macOS and in the simulator (see `test/run-smoke.sh`).
+`test/run-cancel-stages.sh` cancels a compile in SIL generation, the SIL optimizer, the SIL lowering passes, IR
+generation and LLVM optimization (`test/cancel-stages.c`), and `test/sourcekitd/run-cancel.sh` cancels sourcekitd
+requests.
