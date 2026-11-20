@@ -1,0 +1,131 @@
+From ce918ad9e90e834355cd39170413ca7c50437f27 Mon Sep 17 00:00:00 2001
+From: Hyp3rSon1X <44159746+Hyp3rSon1X@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 02:58:59 +0100
+Subject: [PATCH] PackageDescription: build with FoundationEssentials on WASI
+
+On WASI, import FoundationEssentials instead of Foundation in the
+PackageDescription runtime, so that a manifest does not link
+FoundationInternationalization, CoreFoundation and ICU.
+
+The C library functions that `dumpPackageAtExit` uses (`fdopen`, `fputs`,
+`fclose`, `atexit`) are no longer re-exported through Foundation, so import
+WASILibc there.
+
+The registry package identifier check used
+`String.range(of:options:.regularExpression)`, which is part of Foundation and
+backed by ICU. Build a standard library `Regex` from the same pattern
+instead. The diagnostic is unchanged.
+
+All changes are guarded with `#if os(WASI) && canImport(FoundationEssentials)`;
+other platforms keep importing Foundation.
+---
+ Sources/PackageLoading/ContextModel.swift          |  6 ++++++
+ .../PackageDescription/PackageDependency.swift     | 14 +++++++++++++-
+ .../PackageDescription/PackageDescription.swift    |  6 ++++++
+ .../PackageDescriptionSerialization.swift          |  6 ++++++
+ Sources/Runtimes/PackageDescription/Target.swift   |  4 ++++
+ 5 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/Sources/PackageLoading/ContextModel.swift b/Sources/PackageLoading/ContextModel.swift
+index c01935e76..1b14c2d27 100644
+--- a/Sources/PackageLoading/ContextModel.swift
++++ b/Sources/PackageLoading/ContextModel.swift
+@@ -10,7 +10,13 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#if os(WASI) && canImport(FoundationEssentials)
+ #if USE_IMPL_ONLY_IMPORTS
++@_implementationOnly import FoundationEssentials
++#else
++import FoundationEssentials
++#endif
++#elseif USE_IMPL_ONLY_IMPORTS
+ @_implementationOnly import Foundation
+ #else
+ import Foundation
+diff --git a/Sources/Runtimes/PackageDescription/PackageDependency.swift b/Sources/Runtimes/PackageDescription/PackageDependency.swift
+index c61729bc3..ec6b9c557 100644
+--- a/Sources/Runtimes/PackageDescription/PackageDependency.swift
++++ b/Sources/Runtimes/PackageDescription/PackageDependency.swift
+@@ -10,7 +10,13 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#if os(WASI) && canImport(FoundationEssentials)
+ #if USE_IMPL_ONLY_IMPORTS
++@_implementationOnly import FoundationEssentials
++#else
++import FoundationEssentials
++#endif
++#elseif USE_IMPL_ONLY_IMPORTS
+ @_implementationOnly import Foundation
+ #else
+ import Foundation
+@@ -1127,7 +1133,13 @@ extension Package.Dependency {
+         traits: Set<Trait>?
+     ) -> Package.Dependency {
+         let pattern = #"\A[a-zA-Z\d](?:[a-zA-Z\d]|-(?=[a-zA-Z\d])){0,38}\.[a-zA-Z0-9](?:[a-zA-Z0-9]|[-_](?=[a-zA-Z0-9])){0,99}\z"#
+-        if id.range(of: pattern, options: .regularExpression) == nil {
++#if os(WASI) && canImport(FoundationEssentials)
++        // `range(of:options:)` comes from Foundation (ICU); the standard library's regex engine takes the same pattern.
++        let isValid = (try? Regex(pattern)).map { id.firstMatch(of: $0) != nil } ?? false
++#else
++        let isValid = id.range(of: pattern, options: .regularExpression) != nil
++#endif
++        if !isValid {
+             errors.append("Invalid package identifier: '\(id)'")
+         }
+ 
+diff --git a/Sources/Runtimes/PackageDescription/PackageDescription.swift b/Sources/Runtimes/PackageDescription/PackageDescription.swift
+index 60e2d7695..1ead4ea61 100644
+--- a/Sources/Runtimes/PackageDescription/PackageDescription.swift
++++ b/Sources/Runtimes/PackageDescription/PackageDescription.swift
+@@ -14,7 +14,13 @@
+ @_implementationOnly import ucrt
+ @_implementationOnly import struct WinSDK.HANDLE
+ #endif
++#if os(WASI) && canImport(FoundationEssentials)
++// FoundationEssentials does not re-export the C library, which provides `fdopen`, `fputs`, `fclose` and `atexit`.
++@_implementationOnly import WASILibc
++@_implementationOnly import FoundationEssentials
++#else
+ @_implementationOnly import Foundation
++#endif
+ 
+ /// The configuration of a Swift package.
+ ///
+diff --git a/Sources/Runtimes/PackageDescription/PackageDescriptionSerialization.swift b/Sources/Runtimes/PackageDescription/PackageDescriptionSerialization.swift
+index d37021c7b..31f4804d9 100644
+--- a/Sources/Runtimes/PackageDescription/PackageDescriptionSerialization.swift
++++ b/Sources/Runtimes/PackageDescription/PackageDescriptionSerialization.swift
+@@ -10,7 +10,13 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#if os(WASI) && canImport(FoundationEssentials)
+ #if USE_IMPL_ONLY_IMPORTS
++@_implementationOnly import FoundationEssentials
++#else
++import FoundationEssentials
++#endif
++#elseif USE_IMPL_ONLY_IMPORTS
+ @_implementationOnly import Foundation
+ #else
+ import Foundation
+diff --git a/Sources/Runtimes/PackageDescription/Target.swift b/Sources/Runtimes/PackageDescription/Target.swift
+index 9c7183a82..c21ae868b 100644
+--- a/Sources/Runtimes/PackageDescription/Target.swift
++++ b/Sources/Runtimes/PackageDescription/Target.swift
+@@ -10,7 +10,11 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
++#if os(WASI) && canImport(FoundationEssentials)
++@_implementationOnly import FoundationEssentials
++#else
+ @_implementationOnly import Foundation
++#endif
+ 
+ /// The basic building block of a Swift package.
+ ///

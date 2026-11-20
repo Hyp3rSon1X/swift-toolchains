@@ -16,6 +16,9 @@ upstream fixes (or fixes we intend to upstream), built from public forks under t
   [`swifthost/wasm-threads-sdk/`](swifthost/wasm-threads-sdk/README.md). From `6.4.2-2`, the bundle
   (`swift-6.4.2-RELEASE_wasm-threads-tailcall`) is built with WebAssembly tail calls for async code, from sources with
   upstream fixes picked; see [`swifthost/wasm-threads-sdk/tailcall/`](swifthost/wasm-threads-sdk/tailcall/README.md).
+- `swifthost-packagedescription-<version>-<n>`: SwiftPM's `PackageDescription` and `CompilerPluginSupport` as static
+  libraries for that tail-call SDK, so a `Package.swift` can be compiled to WebAssembly and evaluated in a WebAssembly
+  runtime; see [`swifthost/packagedescription/`](swifthost/packagedescription/README.md).
 
 Every fix ships with a reproducer under `tests/` that must fail on the official release and pass on ours,
 on x86_64 and aarch64.
@@ -31,7 +34,7 @@ owner, date and reason). A pinned id keeps its GitHub release `swift-<id>`, the 
 limits: the releases-per-line limit and the mirror's newest 3 are computed over the unpinned releases, and the GHCR
 `keep-n-tagged` is raised by 2 tags per pin. Remove a pin in a commit as soon as its consumer has moved on.
 
-A `swifthost-<version>-<n>` or `swifthost-sdk-wasip1-threads-<version>-<n>` line pins the GitHub release of that name
+A `swifthost-<version>-<n>`, `swifthost-sdk-wasip1-threads-<version>-<n>` or `swifthost-packagedescription-<version>-<n>` line pins the GitHub release of that name
 (it is a release tag already and has no images).
 swifthost releases are their own line per version (`swifthost-<version>`), so they never count against the toolchain
 releases, and vice versa.
