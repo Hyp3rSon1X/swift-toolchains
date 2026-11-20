@@ -20,7 +20,7 @@ The stack depth then stays flat: 10,000,000 awaits and 1,000,000 actor hops run 
 
 ## Sources
 
-Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except for two repositories:
+Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except for three repositories:
 
 - `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `37591f512993731dc2a9739dfb2912fdf5d17775`.
   It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus three cherry-picks and one fix of our own (the SDK `-2` was built from
@@ -43,6 +43,9 @@ Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except
     during stack-protector splitting". Without it, a tail call in a function with a stack protector is invalid.
   - `38e6c0073c423c3945a92d8bb4bf43db029b9d56`, llvm/llvm-project#227491, "[WebAssembly] Do not tail call with byval
     arguments". Without it, a struct passed by value in tail position points into a released frame.
+- `wasi-libc`: Hyp3rSon1X/wasi-libc, branch `hyp3r/wasm-sdk/6.4.2`, `85613c6915f511541354e6f285e6d6a59900581d`
+  (new in `-4`). It is Swift 6.4.2's wasi-libc pin (`2fc32bc81b9f`) plus one commit of our own, "Export a per-thread
+  __stack_limit global on wasi-threads" (not yet upstream). See "Changes in -4".
 
 `build-system.patch` touches `utils/swift_build_support` only. It adds `-mtail-call` (C/C++) and `-Xcc -mtail-call`
 (Swift) to the threads stdlib and runtime, and to the threads builds of libxml2, Foundation (swift-foundation,
@@ -66,12 +69,56 @@ inlinable, so code compiled against `-2` is fixed by relinking against the `-3` 
 The regression test is `test/stdlib/Synchronization/Mutex/WasmMutexHandoff.swift` in the swift fork commit (an
 executable test for `OS=wasip1`, copied here as `test/WasmMutexHandoff.swift`). `test/mutex_stress.sh` is the SDK-level check.
 
+## Changes in -4
+
+`swifthost-sdk-wasip1-threads-6.4.2-4` lets a runtime detect a stack overflow on a pthread. wasi-libc gives a pthread a
+stack from `malloc()` (by default min(main stack, 8 MiB)) with no guard below it, because there is no `mprotect`. Only
+libc knows where that stack ends, so an overflow runs into the heap blocks below the stack and corrupts them silently
+before anything traps.
+
+The contract:
+- A module that links `pthread_create` (it imports `wasi.thread-spawn`) exports a mutable i32 global `__stack_limit`.
+  A module without the export has no limit. Code that starts no thread, including Swift concurrency's cooperative
+  executor, does not link `pthread_create`.
+- Each thread runs in its own instance, so the value is per thread: the lowest valid stack pointer of that pthread.
+  That is the low end of the `malloc`'ed stack above the guard, or the low end of the buffer passed to
+  `pthread_attr_setstack`, and equals `stackaddr - stacksize` from `pthread_getattr_np` (`pthread_attr_getstack`
+  returns it as the address).
+- `wasi_thread_start` sets `__stack_limit` before `__stack_pointer`, so the limit is in place when the thread's stack
+  pointer is first written.
+- The main thread, and every thread before `wasi_thread_start` runs, has `__stack_limit` 0, which means no limit.
+- A runtime can check every write of `__stack_pointer`: trap when `limit != 0 && new_sp < limit`, with the export looked
+  up once per instance.
+- The default guard size on `wasm32-unknown-wasip1-threads` is now 8 KiB (it was 0). The guard is not protected; it is
+  slack below `__stack_limit`. LLVM lets leaf functions with frames of up to 128 bytes store below the stack pointer
+  without writing `__stack_pointer` back, so a check on `__stack_pointer` cannot see those stores; the guard keeps them
+  out of the heap. `pthread_attr_setguardsize` now accepts nonzero sizes on this target (up to `SIZE_MAX/8`, as in
+  musl; before, it returned `EINVAL` for anything but 0), so the slack can be enlarged and a size read with
+  `pthread_attr_getguardsize` can be set again. `pthread_attr_setguardsize(0)` still gives no guard, and
+  `pthread_attr_setstack` stacks have none.
+
+`pthread_create` also computes the thread's `stack_size` from the 16-byte aligned stack top now, so that
+`pthread_getattr_np` matches the limit exactly (before, the size could be up to 15 bytes too large).
+
+`-4` differs from `-3` in two archives of `WASI.sdk/lib/wasm32-wasip1-threads` only; the compiler, the Swift and
+Foundation libraries, module and interface files, the toolset and every other file of the bundle are byte-identical:
+- `libc.a`: the code of `wasi_thread_start.s`, `pthread_create.c`, `pthread_attr_setguardsize.c` and `default_attr.c`
+  (the 8 KiB default guard).
+  The other members that include `pthread_impl.h` were recompiled with the fork's clang (`-3` still had objects
+  built by the release clang); they differ in their `producers` section only.
+- `libwasi-emulated-signal.a`: `strsignal.c` was recompiled the same way; its `producers` section differs, nothing else.
+
+wasi-libc is a static archive, so code compiled against `-3` gets the limit by relinking against `-4`.
+
+The regression test is `test/src/pthread_stack_limit.c` in the wasi-libc fork commit (registered for the threads
+target in `test/CMakeLists.txt`), copied here as `test/stack_limit.c`. `test/stack_limit.sh` is the SDK-level check.
+
 ## Steps (macOS arm64, Xcode 27.2, cmake and ninja on PATH)
 
 ```
 export W=<empty build directory>
 ../fetch-src.sh                                 # as for the plain threads SDK
-./use-forks.sh                                  # swift and llvm-project to the fork commits, applies build-system.patch
+./use-forks.sh                                  # swift, llvm-project and wasi-libc to the fork commits, applies build-system.patch
 ../build.sh                                     # upstream build-script --build-wasi-stdlib (ends with "build-script exit 1": see below)
 ../gen-sdk.sh wasm32-unknown-wasip1-threads
 ./package.sh                                    # writes $W/dist-tailcall/swift-6.4.2-RELEASE_wasm-threads-tailcall.artifactbundle.zip
@@ -82,10 +129,11 @@ products are built (the just-built toolchain has no `swift-run`).
 
 If `$W` already holds a build of other sources: the standalone stdlib builds do not depend on the compiler binary.
 Delete `$W/build/wasm/wasithreadsstdlib-macosx-arm64` and `$W/build/wasm/wasiswiftsdk-macosx-arm64/*/wasm32-unknown-wasip1-threads`
-before `../build.sh`, or nothing is recompiled with the new compiler.
+before `../build.sh`, or nothing is recompiled with the new compiler. wasi-libc needs nothing deleted: its build
+recompiles the objects whose sources changed.
 
 Differences from the parent recipe:
-- The swift and llvm-project sources and `build-system.patch` described above.
+- The swift, llvm-project and wasi-libc sources and `build-system.patch` described above.
 - `package.sh` renames the bundle, artifact and info.json entry to `swift-6.4.2-RELEASE_wasm-threads-tailcall`. The
   triple stays the same, so select the SDK by its id.
 - The toolset adds `-Xcc -mtail-call` to `swiftCompiler`, and `-mtail-call` to `cCompiler` and `cxxCompiler`.
@@ -97,7 +145,7 @@ Differences from the parent recipe:
 - Code built without the flag is not supported. It links, but calls to `swift_continuation_await`
   (`withCheckedContinuation`, `withUnsafeContinuation`) trap. The caller's own frames also still nest.
 - The Swift compiler needs the swift pick #93062, and its LLVM needs #12648, #230073 and #227491. SwiftHostCompiler
-  `swifthost-6.4.2-3` has all four. The swift.org 6.4.2 toolchain does not: with it, `-Xcc -mtail-call`
+  `swifthost-6.4.2-3` and later have all four. The swift.org 6.4.2 toolchain does not: with it, `-Xcc -mtail-call`
   has no effect on async code, which is the unsupported case above.
 - The runtime needs the tail-call proposal. For WAMR, use `-DWAMR_BUILD_TAIL_CALL=1` and
   `-DWAMR_BUILD_LIB_WASI_THREADS=1`.
@@ -116,6 +164,9 @@ The probes:
   (the swift repository's regression test);
 - `byval.c`: structs passed by value in tail position, which must not become `return_call`, plus a control call that
   must;
+- `stack_limit.c`: `__stack_limit` on the main thread (0) and on pthreads with default attributes, guards of 0, 8 KiB
+  and 64 KiB, 64 KiB and 4 KiB `pthread_attr_setstack` buffers (the 4 KiB one gets its TLS allocated separately), and
+  a detached thread, checked against `pthread_getattr_np` and the address of a local (see "Changes in -4");
 - `common.swift`: progress output for the probes, written to stderr.
 
 Scripts:
@@ -127,6 +178,10 @@ Scripts:
   the results.
 - `byval.sh <clang> <threads-sdk-dir> <out-dir> <iwasm>` compiles `byval.c` with `-mtail-call`, prints the
   `call`/`return_call` use of each function, and runs it.
+- `stack_limit.sh <clang> <threads-sdk-dir> <out-dir> <iwasm> [swiftc]` compiles `stack_limit.c` with both link
+  variants, checks with node that `__stack_limit` is an exported global, and runs it. With a `swiftc`, it also builds and
+  runs `p1_taskgroup`, `p3_mutex` and a program without threads, and checks that a module exports `__stack_limit`
+  exactly when it imports `wasi.thread-spawn`. It prints `stack_limit OK` when everything holds.
 - `validate.mjs <file.wasm>` compiles a module with V8. Its error names the function and the instruction, which is more
   precise than WAMR's loader message.
 
