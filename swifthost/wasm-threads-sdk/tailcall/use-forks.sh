@@ -1,11 +1,11 @@
 #!/bin/bash
 # Run after ../fetch-src.sh: switches $W/src/swift and $W/src/llvm-project to the fork commits that carry the tail-call
-# picks (branch hyp3r/wasm-sdk/6.4.2 in Hyp3rSon1X/swift and Hyp3rSon1X/llvm-project), then applies build-system.patch
+# picks and the Mutex fix (branch hyp3r/wasm-sdk/6.4.2 in Hyp3rSon1X/swift and Hyp3rSon1X/llvm-project), then applies build-system.patch
 # to swift. Usage: W=<build dir> use-forks.sh
 set -euo pipefail
 W=${W:?set W to the build directory}
 HERE=$(cd "$(dirname "$0")" && pwd)
-SWIFT=a9c0b4f09a79885037a86d377ccb470efee6a939
+SWIFT=37591f512993731dc2a9739dfb2912fdf5d17775
 LLVM=11627bca6d44ea33b0fbb74d4c5c0e6c45acc087
 sw() { # repo-dir fork-url commit
   git -C "$W/src/$1" fetch --quiet "$2" "$3" 2>/dev/null || git -C "$W/src/$1" fetch --quiet "$2" hyp3r/wasm-sdk/6.4.2

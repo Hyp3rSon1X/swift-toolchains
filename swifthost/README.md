@@ -120,7 +120,7 @@ stack).
 From `swifthost-6.4.2-3`, compile with `-Xcc -mtail-call` (the `tail-call` WebAssembly feature). Async functions then
 use the `swifttailcc` calling convention, every continuation call is a guaranteed tail call (`return_call`), and the
 stack stays flat. The program must be linked against a Swift SDK whose libraries are built the same way, such as
-`swifthost-sdk-wasip1-threads-6.4.2-2` from this repository (artifact id `swift-6.4.2-RELEASE_wasm-threads-tailcall`,
+`swifthost-sdk-wasip1-threads-6.4.2-3` (or `-2`) from this repository (artifact id `swift-6.4.2-RELEASE_wasm-threads-tailcall`,
 whose toolset adds the flag), and the runtime must support the WebAssembly tail-call proposal (WAMR: built with
 `WASM_ENABLE_TAIL_CALL=1`). Use `-Xcc -mtail-call` only with this compiler or later: `swifthost-6.4.2-2` and the
 swift.org 6.4.2 compiler do not use tail calls for async code even with the flag. Do not mix: code compiled without

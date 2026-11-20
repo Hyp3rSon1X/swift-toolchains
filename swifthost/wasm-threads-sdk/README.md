@@ -4,7 +4,7 @@ Recipe for the `swifthost-sdk-wasip1-threads-6.4.2-1` release: a Swift SDK artif
 (`swift-6.4.2-RELEASE_wasm-threads`) for the target `wasm32-unknown-wasip1-threads`, built from the unmodified
 `swift-6.4.2-RELEASE` sources.
 
-[`tailcall/`](tailcall/README.md) builds `swifthost-sdk-wasip1-threads-6.4.2-2`
+[`tailcall/`](tailcall/README.md) builds `swifthost-sdk-wasip1-threads-6.4.2-2` and `-3`
 (`swift-6.4.2-RELEASE_wasm-threads-tailcall`): the same target with WebAssembly tail calls for async code, from swift
 and llvm-project sources with upstream fixes picked.
 

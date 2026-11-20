@@ -1,6 +1,6 @@
 #!/bin/bash
 # Compile+link probes through SwiftHostCompiler (swifthost_drv) against a threads bundle (JOBS.txt recipe, threads target).
-# Usage: run-swifthost.sh <label> <bundle-dir> <bundle-id> <drv> <tc|notc> [probe-dir] [probes...]
+# Usage: [SWIFT_EXTRA="extra frontend flags"] run-swifthost.sh <label> <bundle-dir> <bundle-id> <drv> <tc|notc> [probe-dir] [probes...]
 set -u
 W=${W:?set W to the build directory}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -18,7 +18,7 @@ for p in "${PROBES[@]}"; do
   printf '%s\n' swift-frontend -c $PD/$p.swift -target wasm32-unknown-wasip1-threads -disable-objc-interop -sdk $SDK/WASI.sdk \
     -resource-dir $SW -use-static-resource-dir -module-cache-path $CACHE -no-color-diagnostics -Xcc -fno-color-diagnostics \
     -empty-abi-descriptor -no-auto-bridging-header-chaining -module-name main -parse-as-library -O -enable-default-cmo \
-    -Xcc -matomics -Xcc -mbulk-memory -Xcc -mthread-model -Xcc posix -Xcc -pthread -Xcc -ftls-model=local-exec "${TC[@]}" \
+    -Xcc -matomics -Xcc -mbulk-memory -Xcc -mthread-model -Xcc posix -Xcc -pthread -Xcc -ftls-model=local-exec "${TC[@]}" ${SWIFT_EXTRA:-} \
     -o $D/main.o > $D/frontend.args
   $DRV frontend $D/frontend.args $D/frontend.out $D/frontend.err 2> $D/frontend.rc; rc1=$?
   printf '%s\n' swift-autolink-extract $D/main.o -o $D/main.autolink > $D/autolink.args
