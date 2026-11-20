@@ -31,9 +31,12 @@
  *   SIGILL, SIGSEGV and SIGTRAP (with SA_ONSTACK), and disables it when no
  *   call and no such work item runs any more, which restores the handlers
  *   that were installed when the first of them began (a handler installed by
- *   someone else in between is replaced). For the duration of each call the calling thread
- *   also gets an alternate signal stack of the library's own; the thread's
- *   previous alternate stack setting is restored before the call returns.
+ *   someone else in between is replaced). In builds with SourceKit a small
+ *   handler of the library's runs in front of LLVM's (it notes whether the
+ *   crash is in sourcekitd's work, then calls LLVM's); it is removed with
+ *   LLVM's. For the duration of each call the calling thread also gets an
+ *   alternate signal stack of the library's own; the thread's previous
+ *   alternate stack setting is restored before the call returns.
  * - A crash or fatal error inside a call is recovered: on the calling thread
  *   (including a stack overflow that reaches the stack's guard page, which
  *   stacks that pthread allocates have), and on the helper threads the call
@@ -82,7 +85,8 @@
  *   one-line diagnostics as in swifthost-6.4.2-1.
  * - LLVM fatal errors (report_fatal_error) go to the library's own handler,
  *   which it installs for the whole process at the first call (or at
- *   sourcekitd_initialize) and keeps installed: in a frontend or autolink
+ *   sourcekitd_initialize, which installs no handler of its own) and keeps
+ *   installed: in a frontend or autolink
  *   call they are reported to its err_fd ("fatal error encountered during
  *   compilation"), in a wasm-ld call to its err_fd ("fatal error in the
  *   linker"), on a compiler helper thread or any other thread to stderr
@@ -98,6 +102,18 @@
  *   resets them (sourcekitd never sets them). Likewise -print-stats and
  *   -stats-output-dir turn on LLVM's process-wide statistics, which then also
  *   count sourcekitd's work.
+ * - Every swifthost_wasm_ld call, with or without -mllvm, resets all of
+ *   LLVM's options to their defaults (cl::ResetAllOptionOccurrences) and then
+ *   parses its -mllvm options, while sourcekitd's threads may be reading
+ *   options; the library cannot serialize this (sourcekitd reads them without
+ *   a lock). Options nobody set are rewritten with the value they already
+ *   have: a formal data race, harmless for the bool options found on
+ *   sourcekitd's paths (for example -assert-continue, -print-no-uuids).
+ *   Options a call did set (-Xllvm, -mllvm) change under sourcekitd's feet,
+ *   and a list or string option (the SIL passes and LLVM have some) that a
+ *   thread reads while it is reset can be read after it was freed. So do not
+ *   pass -Xllvm or -mllvm while sourcekitd is in use, and prefer to link
+ *   while no sourcekitd request is in flight.
  * - Macro expansion inside sourcekitd requests uses the same route as
  *   frontend calls: the app's handler (swifthost_set_plugin_message_handler)
  *   or else the server library named by the request's
@@ -122,19 +138,36 @@
  *   sourcekitd's work at that moment continue until they reach their next
  *   work item; one blocked on a lock the crashed thread held stays blocked
  *   (its request has been answered). swifthost_sourcekitd_status() tells
- *   whether sourcekitd stopped. Frontend calls are not affected and keep
- *   working under the rules above. Only a process restart starts sourcekitd
+ *   whether sourcekitd stopped. Only a process restart starts sourcekitd
  *   again.
+ * - After such a stop, compiler calls keep working on a best-effort basis
+ *   only. The crashed thread skipped its destructors and kept whatever it
+ *   held at that moment; if that was shared process state (a C++ static
+ *   initialization guard, a swift_once, the malloc lock, a lock of the Swift
+ *   runtime's caches, a clang module's lock file in the module cache), later
+ *   compiler calls may block or fail. Restart the app process at the next
+ *   convenient point after swifthost_sourcekitd_status() turns non-zero.
+ * - A crash (signal) or LLVM fatal error recovered in sourcekitd's work
+ *   never counts as a crash of a frontend call: it is attributed on the
+ *   crashing thread, before LLVM counts it. A frontend call that starts or
+ *   ends while such a recovery is in progress waits for it (it takes
+ *   microseconds; after 5 seconds the call stops waiting and may be
+ *   poisoned). Other exits through LLVM's exit path in sourcekitd's work are
+ *   not attributed and poison a frontend call that runs meanwhile.
  * - Not recovered (the process ends as without the library): a crash on a
  *   compiler helper thread that sourcekitd's work starts (clang module
  *   builds and module interface builds recover crashes themselves and turn
  *   them into errors, but a stack overflow there is fatal), a crash in the
  *   request and response object functions (sourcekitd_request_*,
  *   sourcekitd_response_*, sourcekitd_variant_*, sourcekitd_uid_*) and in
- *   the receivers the app passes, which run on the calling thread or are
- *   called by sourcekitd's work (a crash in a receiver called by that work is
- *   recovered and stops sourcekitd), a fault inside libdispatch itself, and
- *   the crash handler overflowing the alternate stack (256 KiB). A crash
+ *   the receivers the app passes (response receivers and the notification
+ *   handler: they run outside crash recovery, after the work item that
+ *   produced the response has ended, or on the calling thread), a fault
+ *   inside libdispatch itself, and the crash handler overflowing the
+ *   alternate stack (256 KiB). The app's plugin message handler is the
+ *   exception: it answers the compiler synchronously from inside
+ *   sourcekitd's work, so a crash in it is recovered and stops sourcekitd
+ *   (see swifthost_plugin_message_handler). A crash
  *   that a compiler helper thread recovers during a frontend call poisons
  *   the library even when it was sourcekitd's helper thread (the two cannot
  *   be told apart).

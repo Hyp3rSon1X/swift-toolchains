@@ -164,6 +164,25 @@ removed, the smoke test still passes (164 MiB, 1,125 files left):
 looks them up while building a module. A program that imports a module the smoke test does not use (RegexBuilder,
 Synchronization, ...) needs that module's `.swiftmodule` directory and its `lib*.a` as well.
 
+## In-process sourcekitd (SOURCEKIT=1)
+
+Built with `SOURCEKIT=1`, the object also exports sourcekitd's C API (`sourcekitd.h`, in-process, no XPC service),
+which shares the process with the compiler calls; see "In-process sourcekitd" in `SwiftHostCompiler.h` for the
+contract. In short:
+
+- A crash or LLVM fatal error in sourcekitd's work stops sourcekitd instead of ending the process: pending and later
+  requests get an error response, `swifthost_sourcekitd_status()` turns non-zero, and only a process restart starts
+  sourcekitd again.
+- After such a stop, compiler calls keep working on a best-effort basis only: if the crashed thread held shared
+  process state (a C++ static initialization guard, a `swift_once`, the malloc lock, a lock of the Swift runtime's
+  caches, a clang module's lock file), later compiler calls may block or fail. Restart the app process at the next
+  convenient point after a recovered crash.
+- The app's response receivers and notification handler run outside the library's crash recovery: a crash there is
+  the app's and ends the process. The app's plugin message handler runs inside sourcekitd's work: a crash there
+  stops sourcekitd.
+- Every `swifthost_wasm_ld` call resets LLVM's process-wide options while sourcekitd may read them; do not pass
+  `-Xllvm`/`-mllvm` while sourcekitd is in use.
+
 ## Limits
 
 - One call at a time per process (calls are serialized internally).
@@ -188,7 +207,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `a76565c359a095385d56f2ecb80db9f72df043f0` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `003c49d77af014861dcbc21613357dd5b33f04a1` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -219,6 +238,22 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   in async code) and `3c9966afca9` (the `swift_task_switch` and `swift_asyncLet_finish` declarations carry the
   `swiftasync` attribute of the runtime's definitions; without it, their WebAssembly signatures differ from the
   runtime's when tail calls are enabled, and every call to them is invalid). Neither is in Swift 6.4.x.
+- `[Frontend]` (`091796f90b9`) `-platform-condition-os` overrides the `os()` condition.
+- For the in-process sourcekitd next to the compiler calls (`SOURCEKIT=1`):
+  - `[SwiftCompilerSources]` (`90e548eb1f7`) `initializeSwiftModules()` is idempotent and thread-safe (sourcekitd
+    and the frontend both call it; the second registration aborted the process).
+  - `[Basic]` (`167a178b3f7`) LLVM's targets are initialized once per process (`swift::initializeLLVMOnce()`).
+  - `[FrontendTool]` (`7bcf8acf27a`) `FrontendObserver::shouldInstallFatalErrorHandler()`: a host keeps its own LLVM
+    fatal error handler during `performFrontend`.
+  - `[AST]` (`4e10b19c6b1`) the host's in-process plugin message handler gets each message's server path.
+  - `[SourceKit]` (`ede680d5e80`) `WorkQueue::setExecutionHook()`: the host runs SourceKit's work items (under its
+    crash recovery).
+  - `[sourcekitd]` (`6c805f13653`) `sourcekitdInProc::setServiceHooks()`: the host interposes on requests and can
+    turn the service off after a crash.
+  - `[sourcekitd]` (`39319987fc5`) `ServiceHooks::DeliverNotification`: the host calls the notification handler
+    (outside its crash recovery).
+  - `[sourcekitd]` (`003c49d77af`) `ServiceHooks::ShouldInstallFatalErrorHandler`: `sourcekitd_initialize` keeps the
+    host's LLVM fatal error handler.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
