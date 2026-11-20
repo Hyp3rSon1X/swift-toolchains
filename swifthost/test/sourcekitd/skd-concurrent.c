@@ -1,9 +1,11 @@
-// Finds out what happens when the in-process sourcekitd and swifthost_swift_frontend run at the same
-// time in one process (it does not try to fix anything):
+// Checks that the in-process sourcekitd and swifthost_swift_frontend can run at the same time in one
+// process, with the same results as alone:
 //   phase 1: the probe alone (editor.open, cursor info, 20 completions, diagnostics, editor.close);
 //   phase 2: the frontend compile alone (return code, stderr, object hash);
 //   phase 3: the compile on one thread while another thread repeats the probe iteration until the
 //            compile ends; every iteration's results are compared with phase 1, the compile's with phase 2.
+// Also reports the completion latency alone and during the compile (completions of iterations that
+// ended while the compile still ran).
 // Output lines start with "A:" (compile), "B:" (probe) or "RESULT". Exit status 0 when nothing differed.
 //
 //   skd-concurrent <probe options as skd-probe-main> --frontend-args FILE --object PATH --workdir DIR
@@ -68,7 +70,36 @@ typedef struct {
   int failed_status; // a step reported status=error or check=fail
   char first_bad[512];
   int verbose;
+  double complete_ms[64];
+  int completes;
 } iter_t;
+
+// Completion step times: [0] alone (phase 1), [1] during the compile (phase 3).
+static double latency[2][4096];
+static int latencies[2];
+
+static void add_latencies(int which, const iter_t *it) {
+  for (int i = 0; i < it->completes && latencies[which] < 4096; i++)
+    latency[which][latencies[which]++] = it->complete_ms[i];
+}
+
+static int cmp_double(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : x > y;
+}
+
+static void report_latency(const char *what, int which) {
+  int n = latencies[which];
+  char line[300];
+  if (!n) {
+    snprintf(line, sizeof line, "completion latency %s: no completions", what);
+  } else {
+    qsort(latency[which], (size_t)n, sizeof(double), cmp_double);
+    snprintf(line, sizeof line, "completion latency %s: %d completions, median %.1f ms, p90 %.1f ms, max %.1f ms",
+             what, n, latency[which][n / 2], latency[which][(n * 9) / 10], latency[which][n - 1]);
+  }
+  say("RESULT", line);
+}
 
 static void collect(const char *line, void *ctx) {
   iter_t *it = ctx;
@@ -80,6 +111,9 @@ static void collect(const char *line, void *ctx) {
     return;
   it->sig = fnv_bytes(it->sig, r, (size_t)(e - r));
   it->steps++;
+  const char *ms = strstr(line, " ms=");
+  if (!strncmp(line, "step=complete#", 14) && ms && it->completes < 64)
+    it->complete_ms[it->completes++] = atof(ms + 4);
   if ((strstr(line, "status=error") || strstr(line, "check=fail")) && !it->first_bad[0])
     snprintf(it->first_bad, sizeof it->first_bad, "%.400s", line);
   if (it->verbose)
@@ -145,6 +179,8 @@ static void *prober_main(void *arg) {
     iter_t it;
     uint64_t sig = run_iteration(p->cfg, p->steps, 0, &it);
     p->iterations++;
+    if (!atomic_load(p->stop))
+      add_latencies(1, &it);
     if (!p->baseline) p->baseline = sig; // no phase 1: the first iteration is the reference
     char line[700];
     snprintf(line, sizeof line, "iteration %d: %d steps, signature %016llx (%s)%s%s", p->iterations, it.steps,
@@ -244,6 +280,7 @@ int main(int argc, char **argv) {
     run_iteration(&c, "init", 0, &it);
   double t0 = now_ms();
   baseline = run_iteration(&cfg, iter_steps, 1, &alone);
+  add_latencies(0, &alone);
   snprintf(line, sizeof line, "probe alone: %d steps in %.0f ms, signature %016llx%s%s", alone.steps, now_ms() - t0,
            (unsigned long long)baseline, alone.first_bad[0] ? " FAILING: " : "", alone.first_bad);
   say("B", line);
@@ -288,5 +325,7 @@ int main(int argc, char **argv) {
            "probe iterations during/after compile: %d, mismatches vs alone: %d, iterations with a failing step: %d; compile result %s alone",
            pr.iterations, pr.mismatches, pr.bad_steps, compile_same ? "identical to" : "DIFFERENT from");
   say("RESULT", line);
+  report_latency("alone", 0);
+  report_latency("during the compile", 1);
   return (pr.mismatches || pr.bad_steps || !compile_same || c1.rc != 0) ? 1 : 0;
 }
