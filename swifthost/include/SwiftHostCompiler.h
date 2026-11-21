@@ -246,15 +246,16 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    of thousands of statements can build GBs, and freeing them takes about a
    quarter of a second of CPU time per GB. That call then returns
    SWIFTHOST_ECANCELED, or its normal result if it finished first. A call that
-   returns SWIFTHOST_ECANCELED has not written its object file (a file already
-   at the output path is left as it was; with -num-threads, the object and IR
-   files written before the cancel are removed). Its only diagnostic
+   returns SWIFTHOST_ECANCELED has written no object or IR file (an object
+   already at the output path is left as it was; with -num-threads, the object
+   and IR files written before the cancel are removed); other outputs written
+   before the cancel, such as the module or SIL, may exist. Its only diagnostic
    of its own is the error "compilation cancelled" (diagnostic ID
    compilation_cancelled), reported once and without a source location, so
    that its line reads
      <unknown>:0: error: compilation cancelled
    Nothing is reported after it; diagnostics reported before the cancel (about
-   the code) stay. Ignore the outputs of a cancelled call. Does nothing when
+   the code) stay. Ignore every output of a cancelled call. Does nothing when
    no frontend call is running (a call still waiting for its turn is not
    affected), and never affects a later call. Callable from any thread; returns
    immediately. Autolink and wasm-ld calls are not cancellable (they are short

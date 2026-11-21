@@ -153,6 +153,8 @@ and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
   `compilation_cancelled`, see the header), and nothing after it. With `-4`, most cancelled builds also reported
   "the compiler is unable to type-check this expression in reasonable time" for the expressions the type checker
   gave up on, and a cancel after type checking reported nothing.
+- A cancelled call writes no object or IR file (with `-num-threads`, those written before the cancel are removed);
+  outputs written before the cancel, such as the module or SIL, may exist. Ignore every output of a cancelled call.
 - sourcekitd: the code completion after a cancelled one could reuse the cancelled one's half-checked AST and
   return no results; a cancelled operation now leaves nothing for reuse.
 - The fourteen swift fork commits since `-4` are listed under Source and patches. llvm-project, swift-syntax, the API,
@@ -252,7 +254,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `a9d421b117329a0c47f19e770d0ee03306374fb4` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `941d248677bb84590429c1175b4eab5b135b6902` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -320,11 +322,11 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
     leaving an object file (`IRGenOptions::CancellationFlag`). Code generation itself runs to the end.
   - `[Frontend][Sema]` (`cc0ed4e3825`) a cancelled compilation reports exactly one diagnostic, the fatal error
     "compilation cancelled" (no "too complex" errors from the solver, nothing reported after the cancel).
-  - `[Sema][SILGen]` (`fc877fb6429`) code that the type checker and SIL generation type-check on demand keeps the
+  - `[Sema][SILGen]` (`7721e874127`) code that the type checker and SIL generation type-check on demand keeps the
     cancellation error: a cancelled caller-side default argument becomes an error expression instead of being
     retried at its declaration (the retry dropped the error), and a synthesized body is checked for a cancellation
     before it is taken as type-checked. SIL generation also accepts an error expression once cancelled.
-  - `[IRGen][Frontend]` (`a9d421b1173`) one check decides about a cancellation for each output: with `-num-threads`
+  - `[IRGen][Frontend]` (`941d248677b`) one check decides about a cancellation for each output: with `-num-threads`
     the one after the code generation threads, which removes the object and IR files they wrote; with one module the
     frontend's, before the IR file is written. IR generation reports a cancellation as an error.
 
