@@ -296,7 +296,7 @@ cmd_package() {
   cp "$SRC/swift-experimental-string-processing/LICENSE.txt" "$D/licenses/swift-experimental-string-processing-LICENSE.txt"
   cp "$SRC/swift-syntax/LICENSE.txt" "$D/licenses/swift-syntax-LICENSE.txt"
   cp -R "$D/licenses" "$D/SwiftHostCompiler.xcframework/licenses"
-  (cd "$D" && ditto -c -k --sequesterRsrc --keepParent SwiftHostCompiler.xcframework "SwiftHostCompiler-$id.xcframework.zip")
+  (cd "$D" && ditto -c -k --norsrc --noextattr --keepParent SwiftHostCompiler.xcframework "SwiftHostCompiler-$id.xcframework.zip")
   cp "$HERE/JOBS.txt" "$D/JOBS.txt"
   # One line per release asset; the license files are attached by their file names.
   (cd "$D" && shasum -a 256 "SwiftHostCompiler-$id.xcframework.zip" JOBS.txt > SHA256SUMS)

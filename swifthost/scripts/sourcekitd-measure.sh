@@ -83,7 +83,7 @@ variant() { # name defines objects...
   mkdir -p "$d"
   for o in "$@"; do obytes=$((obytes + $(stat -f %z "$o"))); done
   xcrun libtool -static -o "$d/lib.a" "$@"
-  (cd "$d" && ditto -c -k --sequesterRsrc --keepParent lib.a lib.a.zip)
+  (cd "$d" && ditto -c -k --norsrc --noextattr --keepParent lib.a lib.a.zip)
   # shellcheck disable=SC2086 # defines is a word list
   xcrun clang -target $TRIPLE -isysroot "$SYSROOT" -O1 $defines -c "$M/app.c" -o "$d/app.o"
   xcrun clang++ -target $TRIPLE -isysroot "$SYSROOT" "$d/app.o" "$d/lib.a" \
