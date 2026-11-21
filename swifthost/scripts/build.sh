@@ -38,7 +38,7 @@ CXX=$(xcrun -f clang++)
 
 # Pinned sources. swift and llvm-project carry the patches listed in the README.
 SWIFT_REPO=https://github.com/Hyp3rSon1X/swift.git
-SWIFT_COMMIT=941d248677bb84590429c1175b4eab5b135b6902
+SWIFT_COMMIT=557485911d1b5940b9fa39f9ee42c8dbbfcfb43a
 LLVM_REPO=https://github.com/Hyp3rSon1X/llvm-project.git
 LLVM_COMMIT=e9a6797a92ff70f31318833c2539a129734ebe9c
 CMARK_REPO=https://github.com/swiftlang/swift-cmark.git

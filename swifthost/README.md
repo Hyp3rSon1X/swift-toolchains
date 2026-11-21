@@ -131,6 +131,25 @@ awaits still overflow the stack.
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
 
+## Changes in swifthost-6.4.2-6
+
+- Sendable checking (region-based isolation) no longer takes memory and time that grow with the square of one
+  function's size. It kept, for every basic block, the region of every value tracked so far; those copies now share
+  everything they have in common. One function of 1,000 statements with closures (`-Onone -swift-version 6`,
+  in-process on macOS): 6.2 s of CPU time and a 349 MB peak footprint instead of 14.5 s and 2.7 GB, of which
+  sendable checking 0.2 s instead of 5.7 s. 2,000 and 4,000 statements: 20.7 s / 1.0 GB and 48.9 s / 2.9 GB, where
+  `-5` went past 5 GB; the peak now comes from code generation, and sendable checking stays below 340 MB.
+  Diagnostics and objects are the same as with `-5`.
+- A cancel inside the sendable checking of such a function returns within 25-75 ms of CPU time (with `-5`, freeing
+  its GBs alone took 0.6-0.9 s).
+- Still slow, as with `-5`: one function whose loops merge regions on every iteration, for example thousands of
+  `for` loops that each link a new object to the previous one. Each merge of two regions walks every tracked value
+  of the function, so the time grows with about the cube of the number of loops: sendable checking takes 1-3 s
+  for 1,000 such loops (`-5`: 10 s), about 40 s and 1.2 GB for 2,000 (`-5`: 81 s, 3 GB), and goes past 5 GB for
+  4,000 (as with `-5`).
+- The five swift fork commits since `-5` are listed under Source and patches. llvm-project, swift-syntax, the API,
+  `JOBS.txt` and the built-in macro module are the same as in `-5`.
+
 ## Changes in swifthost-6.4.2-5
 
 - `swifthost_request_cancel()` no longer waits for the end of the stage it lands in: type checking stops at the
@@ -247,6 +266,8 @@ contract. In short:
   passed on to the handlers that were installed before the call, but without its fault details, and crash recovery
   stays off for the rest of that call; see the header.
 - A stack overflow on a helper thread (8 MiB) cannot be recovered and ends the process.
+- Sendable checking of one function whose loops merge regions on every iteration still grows faster than the
+  function (see Changes in swifthost-6.4.2-6).
 
 ## Source and patches
 
@@ -254,7 +275,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `941d248677bb84590429c1175b4eab5b135b6902` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `557485911d1b5940b9fa39f9ee42c8dbbfcfb43a` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -329,6 +350,17 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   - `[IRGen][Frontend]` (`941d248677b`) one check decides about a cancellation for each output: with `-num-threads`
     the one after the code generation threads, which removes the object and IR files they wrote; with one module the
     frontend's, before the IR file is written. IR generation reports a cancellation as an error.
+- Memory and time of sendable checking on large functions (from `swifthost-6.4.2-6`); region labels, diagnostics
+  and objects stay the same:
+  - `[SILOptimizer]` (`2353b191b9e`) isolation history is recorded only if its factory was built with recording on;
+    the region analysis builds it with recording off (nothing in 6.4.2 rewinds it).
+  - `[SILOptimizer]` (`fead368f62c`) a partition's element-to-region map is a persistent radix trie
+    (`PersistentIndexMap`): copying it is O(1), and a change copies only the nodes on its path.
+  - `[SILOptimizer]` (`63cf97fdeed`) joining into a partition without elements shares the other side's map.
+  - `[SILOptimizer]` (`ef76a76bee8`) canonicalization relabels only the regions created since the partition was last
+    canonical.
+  - `[SILOptimizer]` (`557485911d1`) the trie's leaves record which slots are occupied, so a walk costs the number of
+    entries, not the range of element numbers.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 

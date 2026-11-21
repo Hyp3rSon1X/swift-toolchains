@@ -243,8 +243,8 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    loading, one SIL pass on one function, and LLVM code generation of the whole
    module (up to seconds for a function of thousands of statements). Before it
    returns, the call frees what it built: the sendable checking of one function
-   of thousands of statements can build GBs, and freeing them takes about a
-   quarter of a second of CPU time per GB. That call then returns
+   of 4,000 statements holds about 300 MB, and a cancel there returns within
+   about 75 ms of CPU time. That call then returns
    SWIFTHOST_ECANCELED, or its normal result if it finished first. A call that
    returns SWIFTHOST_ECANCELED has written no object or IR file (an object
    already at the output path is left as it was; with -num-threads, the object
