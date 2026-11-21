@@ -247,8 +247,8 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    quarter of a second of CPU time per GB. That call then returns
    SWIFTHOST_ECANCELED, or its normal result if it finished first. A call that
    returns SWIFTHOST_ECANCELED has not written its object file (a file already
-   at the output path is left as it was; with -num-threads, the object files of
-   the modules finished before the cancel are removed). Its only diagnostic
+   at the output path is left as it was; with -num-threads, the object and IR
+   files written before the cancel are removed). Its only diagnostic
    of its own is the error "compilation cancelled" (diagnostic ID
    compilation_cancelled), reported once and without a source location, so
    that its line reads
