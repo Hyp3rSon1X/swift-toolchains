@@ -12,16 +12,18 @@
  * after the request and leaves nothing in the case's output directory (no output, no temporary file), or, with a
  * file already at the output path, leaves only that file, unchanged.
  * A cancel that lands in a stage only stops it if the stage checks; a call that finishes first fails the case.
- * Then a sweep: the constructs program (see constructsFile) is compiled uncancelled and then cancelled at points of
- * CPU time spread over the whole compile and over its SIL generation; every call must return SWIFTHOST_ECANCELED
- * without leaving output, or succeed (without diagnostics) if it finished first. Every cancelled call must report
+ * Then two sweeps: the constructs program (see constructsFile) is compiled uncancelled and then cancelled at points
+ * of CPU time spread over the whole compile and over its SIL generation, the defaults program (see defaultsProgram)
+ * at points over its type checking and SIL generation; every call must return SWIFTHOST_ECANCELED without leaving
+ * output, or succeed (without diagnostics) if it finished first. Every cancelled call must report
  * exactly one diagnostic, "error: compilation cancelled". At the end an uncancelled compile in the same process
  * must succeed (a crash would have left the library returning SWIFTHOST_EPOISONED).
  *
  * Programs: interp.swift, many functions whose statements are string interpolations (SIL generation emits each
  * interpolation's body as a brace statement inside an expression); lib.swift, 30 functions of 10 statements
  * with closures, at -O (about a second of SIL optimization and LLVM optimization); constructs/, six files of types
- * with derived conformances and the like, whose synthesized code SIL generation type-checks on demand.
+ * with derived conformances, caller-side default arguments and the like, whose synthesized code and defaults SIL
+ * generation type-checks on demand; defaults.swift, many calls with caller-side default arguments.
  */
 #include "SwiftHostCompiler.h"
 
@@ -47,8 +49,12 @@ enum {
   SAMPLE_US = 250,
   CONSTRUCT_FILES = 6,
   CONSTRUCT_TYPES = 8, /* per file */
+  TRACE_CALLS = 24,     /* per traces function, in one statement */
   SWEEP_WHOLE = 16,     /* cancel points spread over the whole compile */
   SWEEP_SILGEN = 16,    /* and over its SIL generation */
+  DEFAULT_FUNCS = 24,   /* defaults.swift: functions with caller-side defaults */
+  DEFAULT_CALLS = 48,   /* calls per function, in one statement */
+  SWEEP_CHECK = 24,     /* its cancel points, over type checking and SIL generation */
 };
 
 static const char *SDK, *WORK;
@@ -326,7 +332,13 @@ typedef struct {
 /* The constructs program: CONSTRUCT_FILES files of declarations whose code the compiler synthesizes and type-checks
    on demand, some of it only while generating SIL (derived Equatable, Hashable, Codable and RawRepresentable
    members, CodingKeys, memberwise initializers), next to string literals and interpolations, lazy properties,
-   property wrappers, default arguments, generics, protocols and closures; main.swift uses some of it. */
+   property wrappers, default arguments, generics, protocols and closures; main.swift uses some of it. The trace
+   functions have caller-side default arguments (#file, #fileID, #line, #column, #function, nil, [], [:]), which
+   SIL generation type-checks at each call: calls in plain statements (many in one statement in the traces
+   functions, so that a cancel in the middle of one is followed by more defaults), in closures and local
+   functions (whose captures are computed on demand), in a default argument, and in initial values that become
+   synthesized code (a lazy property, a property wrapper's backing initializer, a stored property used by a
+   memberwise initializer). */
 static void constructsFile(FILE *f, int k) {
   if (k == 0)
     fputs("@propertyWrapper\n"
@@ -369,16 +381,53 @@ static void constructsFile(FILE *f, int k) {
             "}\n\n",
             k, i, k);
     fprintf(f,
+            "public func trace%d_%d(_ message: String, file: String = #file, fileID: String = #fileID,\n"
+            "                     line: Int = #line, column: Int = #column, function: String = #function,\n"
+            "                     x: Int? = nil, xs: [Int] = [], d: [String: Int] = [:]) -> String {\n"
+            "  \"\\(fileID):\\(line):\\(column) \\(function) \\(message) \\(x ?? xs.count + d.count)\"\n"
+            "    + \" \\(file.isEmpty)\"\n"
+            "}\n\n",
+            k, i);
+    /* One statement with many calls: a cancel while SIL generation emits it is followed by more defaults. */
+    fprintf(f, "public func traces%d_%d(_ n: Int, _ s: String) -> [String] {\n  let all: [String] = [\n", k, i);
+    for (int j = 0; j < TRACE_CALLS; ++j) {
+      switch (j % 4) {
+      case 0: fprintf(f, "    trace%d_%d(\"t%d\"),\n", k, i, j); break;
+      case 1: fprintf(f, "    trace%d_%d(\"t%d\", x: n),\n", k, i, j); break;
+      case 2: fprintf(f, "    trace%d_%d(s, xs: [n, %d]),\n", k, i, j); break;
+      default: fprintf(f, "    trace%d_%d(\"t%d\", d: [s: %d]),\n", k, i, j, j); break;
+      }
+    }
+    fprintf(f, "  ]\n  return all + (0..<n).map { trace%d_%d(\"closure \\($0)\", x: $0) }\n}\n\n", k, i);
+    fprintf(f,
+            "public struct Mark%d_%d: Equatable {\n"
+            "  public var at: String = trace%d_%d(\"memberwise\")\n"
+            "  public var count: Int = 0\n"
+            "}\n\n",
+            k, i, k, i);
+    fprintf(f,
             "public final class Box%d_%d {\n"
             "  @Clamped(0...100) public var level: Int = %d\n"
+            "  @Clamped(0...100) public var depth: Int = trace%d_%d(\"wrapped\").count\n"
             "  public lazy var label: String = \"box \\(level) of \\(type(of: self))\"\n"
+            "  public lazy var origin: String = trace%d_%d(\"lazy\", d: [\"k\": level])\n"
+            "  public var made: String = trace%d_%d(\"stored\")\n"
             "  public var items: [Item%d_%d] = [Item%d_%d()]\n"
             "  public init() {}\n"
             "  public func summary(limit: Int = %d, separator: String = \"; \") -> String {\n"
             "    items.prefix(limit).map { $0.describe() }.joined(separator: separator) + label\n"
             "  }\n"
+            "  public func log(_ n: Int, note: String = trace%d_%d(\"default argument\")) -> [String] {\n"
+            "    var lines = [trace%d_%d(\"plain \\(n)\"), trace%d_%d(\"x\", x: n), origin, made]\n"
+            "    lines += (0..<n).map { trace%d_%d(\"closure \\($0)\", xs: [$0, depth]) }\n"
+            "    func local() -> String { trace%d_%d(\"local\", xs: [n]) + trace%d_%d(\"local again\") }\n"
+            "    lines.append(local())\n"
+            "    lines.append(Mark%d_%d(count: n).at)\n"
+            "    lines.append(note)\n"
+            "    return lines\n"
+            "  }\n"
             "}\n\n",
-            k, i, i % 100, k, i, k, i, i + 1);
+            k, i, i % 100, k, i, k, i, k, i, k, i, k, i, i + 1, k, i, k, i, k, i, k, i, k, i, k, i, k, i);
     fprintf(f,
             "public func tally%d_%d<T: Hashable & Sendable>(_ xs: [T],\n"
             "                       key: (T) -> String = { \"\\($0)\" }) -> [String: Int] {\n"
@@ -394,8 +443,8 @@ static void constructsMain(FILE *f) {
   for (int k = 0; k < CONSTRUCT_FILES; ++k)
     fprintf(f,
             "print(tally%d_0([Item%d_0(), Item%d_0()]).count, Box%d_0().summary(),\n"
-            "      Color%d_0(rawValue: \"red-0\") ?? .other)\n",
-            k, k, k, k, k);
+            "      Color%d_0(rawValue: \"red-0\") ?? .other, Box%d_0().log(2).count, trace%d_0(\"main\"))\n",
+            k, k, k, k, k, k, k);
 }
 
 static void writeConstructs(void) {
@@ -412,6 +461,32 @@ static void writeConstructs(void) {
     fclose(f);
   }
   writeFile(fmt("%s/main.swift", dir), constructsMain);
+}
+
+/* The defaults program: functions whose bodies call a function with caller-side default arguments many times. The
+   type checker checks each call's defaults on demand after the body (actor isolation checking looks at them), and
+   SIL generation does at each call: a cancel in the middle is followed by more of them. */
+static void defaultsProgram(FILE *f) {
+  for (int i = 0; i < DEFAULT_FUNCS; ++i) {
+    fprintf(f,
+            "public func trace%d(_ message: String, file: String = #file, fileID: String = #fileID,\n"
+            "                   line: Int = #line, column: Int = #column, function: String = #function,\n"
+            "                   x: Int? = nil, xs: [Int] = [], d: [String: Int] = [:]) -> String {\n"
+            "  \"\\(fileID):\\(line):\\(column) \\(function) \\(message) \\(x ?? xs.count + d.count)\"\n"
+            "    + \" \\(file.isEmpty)\"\n"
+            "}\n\n",
+            i);
+    fprintf(f, "public func traces%d(_ n: Int, _ s: String) -> [String] {\n  let all: [String] = [\n", i);
+    for (int j = 0; j < DEFAULT_CALLS; ++j) {
+      switch (j % 4) {
+      case 0: fprintf(f, "    trace%d(\"t%d\"),\n", i, j); break;
+      case 1: fprintf(f, "    trace%d(\"t%d\", x: n),\n", i, j); break;
+      case 2: fprintf(f, "    trace%d(s, xs: [n, %d]),\n", i, j); break;
+      default: fprintf(f, "    trace%d(\"t%d\", d: [s: %d]),\n", i, j, j); break;
+      }
+    }
+    fprintf(f, "  ]\n  return all + (0..<n).map { trace%d(\"closure \\($0)\", x: $0) }\n}\n\n", i);
+  }
 }
 
 static int argsFor(const char **argv, const Case *k, const char *out) {
@@ -483,48 +558,49 @@ static void runCase(const Case *k) {
   CHECK(!*left, "%s: a cancelled call left files in %s: %s", k->tag, dir, left);
 }
 
-/* One whole-module compile of the constructs program, uncancelled, then cancelled at SWEEP_WHOLE points of CPU
-   time spread over the whole compile and SWEEP_SILGEN points over its SIL generation (where the compiler
-   type-checks synthesized code on demand). Every cancelled call must return SWIFTHOST_ECANCELED and leave no
-   output; a call that finished first must succeed. */
-static void sweepConstructs(void) {
-  Case k = {"constructs", NULL, "constructs", "-c", "o", 0, 0};
+/* One whole-module compile of a program, uncancelled, then cancelled at `whole` points of CPU time spread over the
+   whole compile, `silgen` points over its SIL generation (where the compiler type-checks synthesized code on demand)
+   and `check` points over its type checking and SIL generation. Every cancelled call must return SWIFTHOST_ECANCELED
+   and leave no output; a call that finished first must succeed. */
+static void sweep(const char *name, const char *source, int whole, int silgen, int check) {
+  Case k = {name, NULL, source, "-c", "o", 0, 0};
   const char *argv[64];
-  char *dir = fmt("%s/constructs-out", WORK), *out = fmt("%s/out.o", dir);
+  char *dir = fmt("%s/%s-out", WORK, name), *out = fmt("%s/out.o", dir), *err = fmt("%s/%s.err", WORK, name);
   mkdir(dir, 0755);
   clearDir(dir);
   int argc = argsFor(argv, &k, out);
-  Outcome full = run(argv, argc, "constructs", (Trigger){NULL, -1, "SILGen"});
-  printf("%-20s rc %3d  uncancelled: %.0f ms of CPU, SIL generation at %.0f-%.0f ms\n", "constructs", full.rc,
-         full.cpu, full.watchFirst, full.watchLast);
-  char *fullDiag = readFile(fmt("%s/constructs.err", WORK));
-  CHECK(full.rc == 0 && exists(out) && fullDiag && !*fullDiag,
-        "constructs: uncancelled compile: rc %d, diagnostics:\n%s", full.rc, fullDiag ? fullDiag : "(none)");
+  Outcome full = run(argv, argc, name, (Trigger){NULL, -1, "SILGen"});
+  printf("%-20s rc %3d  uncancelled: %.0f ms of CPU, SIL generation at %.0f-%.0f ms\n", name, full.rc, full.cpu,
+         full.watchFirst, full.watchLast);
+  char *fullDiag = readFile(err);
+  CHECK(full.rc == 0 && exists(out) && fullDiag && !*fullDiag, "%s: uncancelled compile: rc %d, diagnostics:\n%s",
+        name, full.rc, fullDiag ? fullDiag : "(none)");
   if (full.rc != 0 || full.watchFirst < 0)
     return;
   int points = 0, cancelled = 0, finished = 0, bad = 0;
-  for (int i = 0; i < SWEEP_WHOLE + SWEEP_SILGEN; ++i) {
-    double at = i < SWEEP_WHOLE ? full.cpu * (i + 0.5) / SWEEP_WHOLE
-                                : full.watchFirst + (full.watchLast - full.watchFirst) * (i - SWEEP_WHOLE) /
-                                                        (SWEEP_SILGEN - 1);
+  for (int i = 0; i < whole + silgen + check; ++i) {
+    double at = i < whole            ? full.cpu * (i + 0.5) / whole
+                : i < whole + silgen ? full.watchFirst + (full.watchLast - full.watchFirst) * (i - whole) /
+                                                             (silgen > 1 ? silgen - 1 : 1)
+                                     : full.watchLast * (i - whole - silgen + 0.5) / check;
     clearDir(dir);
-    Outcome o = run(argv, argc, "constructs", (Trigger){NULL, at, NULL});
+    Outcome o = run(argv, argc, name, (Trigger){NULL, at, NULL});
     ++points;
-    char *left = otherFiles(dir, NULL), *diag = readFile(fmt("%s/constructs.err", WORK));
+    char *left = otherFiles(dir, NULL), *diag = readFile(err);
     if (o.rc == SWIFTHOST_ECANCELED && o.cancelled && !*left && onlyCancellation(diag)) {
       ++cancelled;
     } else if (o.rc == 0 && exists(out) && diag && !*diag) {
       ++finished;
     } else {
       ++bad;
-      printf("constructs: cancel at %.0f ms of CPU: rc %d%s%s, diagnostics:\n%s", at, o.rc, *left ? ", left " : "",
+      printf("%s: cancel at %.0f ms of CPU: rc %d%s%s, diagnostics:\n%s", name, at, o.rc, *left ? ", left " : "",
              left, diag ? diag : "(none)\n");
-      CHECK(0, "constructs: cancel at %.0f ms of CPU: rc %d, files left: %s", at, o.rc, *left ? left : "none");
+      CHECK(0, "%s: cancel at %.0f ms of CPU: rc %d, files left: %s", name, at, o.rc, *left ? left : "none");
     }
   }
-  printf("%-20s %d points: %d cancelled, %d finished first, %d failed\n", "constructs sweep", points, cancelled,
+  printf("%-20s %d points: %d cancelled, %d finished first, %d failed\n", fmt("%s sweep", name), points, cancelled,
          finished, bad);
-  CHECK(cancelled >= SWEEP_SILGEN, "constructs: only %d of %d points were cancelled", cancelled, points);
+  CHECK(cancelled >= silgen + check / 2, "%s: only %d of %d points were cancelled", name, cancelled, points);
 }
 
 int main(int argc, char **argv) {
@@ -539,6 +615,7 @@ int main(int argc, char **argv) {
   writeFile(fmt("%s/lib.swift", WORK), libProgram);
   writeFile(fmt("%s/hello.swift", WORK), helloProgram);
   writeConstructs();
+  writeFile(fmt("%s/defaults.swift", WORK), defaultsProgram);
 
   /* Warm the module cache, so that no case spends its time building modules. */
   Case warm = {"warm", NULL, "hello.swift", "-c", "o", 0, 0};
@@ -568,7 +645,8 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i)
     runCase(&cases[i]);
 
-  sweepConstructs();
+  sweep("constructs", "constructs", SWEEP_WHOLE, SWEEP_SILGEN, 0);
+  sweep("defaults", "defaults.swift", 0, 0, SWEEP_CHECK);
 
   /* The library stays usable. */
   Case after = {"after", NULL, "hello.swift", "-c", "o", 0, 0};
