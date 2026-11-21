@@ -7,7 +7,8 @@
 # <lib> is a slice's prelinked SwiftHostCompiler.o (or a libSwiftHostCompiler.a that keeps its local symbols: the
 # test finds the stages by the addresses of compiler functions in its own binary). <sdk-target-dir> is
 # .../swift-6.4.2-RELEASE_wasm.artifactbundle/swift-6.4.2-RELEASE_wasm/wasm32-unknown-wasip1. The simulator run
-# uses a temporary device (sim-device.sh).
+# uses a temporary device or the shared one of a test session (sim-device.sh); stopping the script (HUP, INT, TERM)
+# stops the test.
 set -euo pipefail
 SLICE=$1 LIB=$(cd "$(dirname "$2")" && pwd)/$(basename "$2") SDK=$3 WORK=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -48,4 +49,4 @@ if [[ $SLICE == macosx ]]; then
 fi
 . "$HERE/sim-device.sh"
 sim_device_create swifthost-cancel-stages || exit 2
-xcrun simctl spawn "$SIM_UDID" "$WORK/cancel-stages" "$SDK" "$WORK" "$WORK/stages.txt"
+proc_run xcrun simctl spawn "$SIM_UDID" "$WORK/cancel-stages" "$SDK" "$WORK" "$WORK/stages.txt"

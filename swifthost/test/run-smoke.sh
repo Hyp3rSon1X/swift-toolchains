@@ -7,7 +7,8 @@
 # <lib> is a slice's libSwiftHostCompiler.a (or the prelinked SwiftHostCompiler.o).
 # <sdk-target-dir> is .../swift-6.4.2-RELEASE_wasm.artifactbundle/swift-6.4.2-RELEASE_wasm/wasm32-unknown-wasip1.
 # <iwasm> is a macOS WAMR iwasm. The simulator run creates a temporary simulator device (named swifthost-smoke-<pid>,
-# deleted on exit; see sim-device.sh), runs the test in it, and then runs the produced modules in iwasm on the host.
+# deleted on exit; see sim-device.sh, which also has the shared device of a test session), runs the test in it, and
+# then runs the produced modules in iwasm on the host. Stopping the script (HUP, INT, TERM) stops the test.
 # After the main run, each crash mode of smoke.c runs in a process of its own (each ends with the library poisoned),
 # then the macro modes: plugin-handler (the app's own plugin message handler) and exec-plugin (executable plugins,
 # run with test/nospawn.c inserted, which aborts on any process creation and logs it).
@@ -15,6 +16,7 @@ set -euo pipefail
 SLICE=$1 LIB=$(cd "$(dirname "$2")" && pwd)/$(basename "$2") SDK=$3 IWASM=$4
 HERE=$(cd "$(dirname "$0")" && pwd)
 INC=$(cd "$HERE/../include" && pwd)
+. "$HERE/sim-device.sh"
 WORK=${5:-$(mktemp -d)}
 mkdir -p "$WORK"
 case $SLICE in
@@ -45,27 +47,30 @@ check_nospawn() {
 
 if [[ $SLICE == macosx ]]; then
   rc=0
-  "$WORK/smoke" "$SDK" "$WORK/run" "$IWASM" "$HERE" || rc=1
+  proc_run "$WORK/smoke" "$SDK" "$WORK/run" "$IWASM" "$HERE" || rc=1
   for mode in $MODES; do
-    "$WORK/smoke" "$SDK" "$WORK/run-$mode" "$IWASM" "$HERE" "$mode" || { echo "FAIL $mode: exit status $?"; rc=1; }
+    proc_run "$WORK/smoke" "$SDK" "$WORK/run-$mode" "$IWASM" "$HERE" "$mode" ||
+      { echo "FAIL $mode: exit status $?"; rc=1; }
   done
-  DYLD_INSERT_LIBRARIES="$WORK/libnospawn.dylib" "$WORK/smoke" "$SDK" "$WORK/run-exec-plugin" - "$HERE" exec-plugin \
-    2> "$WORK/exec-plugin.stderr" || { echo "FAIL exec-plugin: exit status $?"; rc=1; }
+  proc_run env DYLD_INSERT_LIBRARIES="$WORK/libnospawn.dylib" "$WORK/smoke" "$SDK" "$WORK/run-exec-plugin" - "$HERE" \
+    exec-plugin 2> "$WORK/exec-plugin.stderr" || { echo "FAIL exec-plugin: exit status $?"; rc=1; }
   check_nospawn "$WORK/exec-plugin.stderr" || rc=1
   exit $rc
 fi
 
-# A temporary iPhone device of the newest iOS runtime, deleted again when this script exits (sim-device.sh).
-. "$HERE/sim-device.sh"
+# A temporary iPhone device of the newest iOS runtime (or the shared one), deleted again when this script exits
+# (sim-device.sh).
 sim_device_create swifthost-smoke || exit 2
 UDID=$SIM_UDID
 rc=0
-xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" "$WORK/run" - "$HERE" || rc=$?
+proc_run xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" "$WORK/run" - "$HERE" || rc=$?
 for mode in $MODES; do
-  xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" "$WORK/run-$mode" - "$HERE" "$mode" || { echo "FAIL $mode: exit status $?"; rc=1; }
+  proc_run xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" "$WORK/run-$mode" - "$HERE" "$mode" ||
+    { echo "FAIL $mode: exit status $?"; rc=1; }
 done
-SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$WORK/libnospawn.dylib" xcrun simctl spawn "$UDID" "$WORK/smoke" "$SDK" \
-  "$WORK/run-exec-plugin" - "$HERE" exec-plugin 2> "$WORK/exec-plugin.stderr" || { echo "FAIL exec-plugin: exit status $?"; rc=1; }
+proc_run env SIMCTL_CHILD_DYLD_INSERT_LIBRARIES="$WORK/libnospawn.dylib" xcrun simctl spawn "$UDID" "$WORK/smoke" \
+  "$SDK" "$WORK/run-exec-plugin" - "$HERE" exec-plugin 2> "$WORK/exec-plugin.stderr" ||
+  { echo "FAIL exec-plugin: exit status $?"; rc=1; }
 check_nospawn "$WORK/exec-plugin.stderr" || rc=1
 
 # The modules built in the simulator, run on the host.

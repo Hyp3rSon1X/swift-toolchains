@@ -5,7 +5,8 @@
 #                           simulator device (xcrun simctl spawn; spawned processes read and write host paths)
 #
 # Provides SLICE, TRIPLE, SYSROOT, TOOLCHAIN_LIB (the toolchain's lib/swift/<slice>) and slice_run CMD..., which runs
-# CMD on the slice. The device is created on first use of slice_run and deleted when the script exits.
+# CMD on the slice. The device is created on first use of slice_run (or is the shared one of a test session) and
+# deleted when the script exits. Stopping the script (HUP, INT, TERM) stops the test process (proc_run).
 SLICE=${SLICE:-macosx}
 case $SLICE in
   macosx)          TRIPLE=arm64-apple-macosx27.0;;
@@ -25,5 +26,5 @@ slice_device() {
   sim_device_create swifthost-skd-test || exit 2
 }
 slice_run() {
-  if [ "$SLICE" = macosx ]; then "$@"; else slice_device; xcrun simctl spawn "$SIM_UDID" "$@"; fi
+  if [ "$SLICE" = macosx ]; then proc_run "$@"; else slice_device; proc_run xcrun simctl spawn "$SIM_UDID" "$@"; fi
 }
