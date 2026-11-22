@@ -131,6 +131,22 @@ awaits still overflow the stack.
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
 
+## Changes in swifthost-6.4.2-7
+
+- A cancel during SIL simplification no longer aborts the process. In `-6`, a cancel that landed in the
+  simplification of a function (`OnoneSimplification` and the other simplification passes, also at `-O`) could stop
+  it before its end-of-pass fix-ups. The pass manager then failed an always-on assertion
+  (`didn't break infinite loops`, `PassManager.cpp`, signal 6) and ended the app's process, about 2 times in 1,000
+  cancels in an iOS app. Simplification, SILCombine and SimplifyCFG now run their dead-code clean-up and fix-ups
+  also when a cancel stops them.
+- A cancelled compile no longer asserts on pass invariants (infinite loops unbroken, lifetimes incomplete, stack
+  nesting not fixed): while the compile is cancelled, they are cleared instead. Nothing changes without a pending
+  cancel, and the assertions fire as before in a compile that is not cancelled. The hidden frontend option
+  `-Xllvm -sil-cancel-keep-invariant-asserts` keeps the assertions in cancelled compiles, to check that a pass
+  restores its invariants itself.
+- Uncancelled output is the same as with `-6`. The four swift fork commits since `-6` are listed under Source and
+  patches. llvm-project, swift-syntax, the API, `JOBS.txt` and the built-in macro module are the same as in `-6`.
+
 ## Changes in swifthost-6.4.2-6
 
 - Sendable checking (region-based isolation) no longer takes memory and time that grow with the square of one
@@ -275,7 +291,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `557485911d1b5940b9fa39f9ee42c8dbbfcfb43a` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `529a4e2687c7ac29599ef0d3258a91bda1d82deb` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -361,6 +377,15 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
     canonical.
   - `[SILOptimizer]` (`557485911d1`) the trie's leaves record which slots are occupied, so a walk costs the number of
     entries, not the range of element numbers.
+- Cancel during SIL simplification (from `swifthost-6.4.2-7`); without a stop, nothing changes:
+  - `[SILOptimizer]` (`7c9a631b72e`) the simplification pass removes dead code and does its fix-ups
+    (`fixStackNesting`, `breakInfiniteLoops`, `completeLifetimes`) also when it is stopped early.
+  - `[SILOptimizer]` (`bbb7c5cf113`) SILCombine reports the changes of an iteration that was stopped early.
+  - `[SILOptimizer]` (`412d022e93e`) SimplifyCFG removes the unreachable blocks once at the end of a stopped run and
+    includes the current iteration's changes in `dominatorBasedSimplify`.
+  - `[SILOptimizer]` (`529a4e2687c`) fork only: while the compile is cancelled, the pass manager clears the pass
+    invariants instead of asserting on them; the hidden option `-sil-cancel-keep-invariant-asserts` keeps the
+    assertions.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
