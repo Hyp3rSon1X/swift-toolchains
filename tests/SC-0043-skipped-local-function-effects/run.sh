@@ -10,11 +10,13 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"; overlay="${1:-}"
 FE=/usr/bin/swift-frontend
 out=/tmp/sc0043; mkdir -p "$out"
+# extra swiftc flags for hosts where Testing is not on the default search path (macOS toolchain checks)
+EXTRA=(${SC0043_FLAGS:-})
 SKIP=(-Xfrontend -experimental-skip-non-inlinable-function-bodies-without-types)
 
 warnings() { # <label> <flags...>; prints the number of false warnings the typecheck produced
   local label="$1"; shift
-  (cd "$here" && timeout 300 swiftc -swift-version 6 -parse-as-library -typecheck "$@" repro.swift) >"$out/$label.log" 2>&1
+  (cd "$here" && timeout 300 swiftc -swift-version 6 -parse-as-library -typecheck "${EXTRA[@]}" "$@" repro.swift) >"$out/$label.log" 2>&1
   local rc=$?
   [ "$rc" = 0 ] || { echo "typecheck exit $rc" >&2; sed -n 1,20p "$out/$label.log" >&2; }
   grep -c "no calls to throwing functions occur within 'try' expression" "$out/$label.log"
@@ -34,7 +36,7 @@ ok=1
 patched_skip=$(warnings patched-skip "${SKIP[@]}"); patched_plain=$(warnings patched-plain)
 echo "patched with skip flag: $patched_skip warning(s); without: $patched_plain"
 [ "$patched_skip" = 0 ] && [ "$patched_plain" = 0 ] || { echo "FAIL: patched compiler still warns"; ok=0; }
-if (cd "$here" && timeout 300 swiftc -swift-version 6 -parse-as-library -emit-library -module-name M repro.swift -o "$out/libM.so") >"$out/lib.log" 2>&1
+if (cd "$here" && timeout 300 swiftc -swift-version 6 -parse-as-library -emit-library "${EXTRA[@]}" -module-name M repro.swift -o "$out/libM.so") >"$out/lib.log" 2>&1
 then echo "patched full compile: ok"; else echo "FAIL: patched full compile failed"; tail -20 "$out/lib.log"; ok=0; fi
 echo "SUMMARY stock_skip_warnings=$stock_skip stock_plain_warnings=$stock_plain patched_skip_warnings=$patched_skip patched_ok=$ok"
 [ "$ok" = 1 ]
