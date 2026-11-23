@@ -131,6 +131,29 @@ awaits still overflow the stack.
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
 
+## Changes in swifthost-6.4.2-8
+
+- Very large functions at `-O` no longer need gigabytes. LLVM's WebAssembly pass for irreducible control flow
+  (`WebAssemblyFixIrreducibleControlFlow`) built a reachability graph that grew with the square of the number of
+  blocks. It is now upstream's SCC-based version (llvm/llvm-project#184441, backported). One function of 4,000
+  `if` and `?:` statements at `-O` was killed at 6.5 GB with `-7`; it now completes with a peak of about 1.1-1.7 GB
+  (1,000 statements: 302 MiB), in about 72 s of CPU time.
+- A cancel now also stops LLVM code generation (instruction selection, register coalescing and allocation, the
+  WebAssembly passes, the writing of the object), at its next block, instruction, function or pass. Before, it ran
+  to the end first: for one function of 4,000 statements, seconds to half a minute of CPU time and the memory with it.
+  Typical cancel-to-return latency in code generation is 0.06 s of CPU time (90th percentile 0.12 s, longest 0.53 s
+  measured). Still uninterruptible: one running LLVM optimization pass, CodeGenPrepare, and one SIL pass on one giant
+  function (see the header). A cancelled call still leaves no object file and reports one diagnostic.
+- At `-Onone`, wasm32 functions no longer get one local per temporary. Above a threshold of 4,096 32-bit cells of
+  params and locals per function (hidden option `-Xllvm -wasm-o0-reg-coloring-threshold=<cells>`; 0 colors every
+  function), the backend colors the locals as at `-O`; smaller functions are unchanged, byte for byte. The function of
+  4,000 statements went from 120,008 cells to 13, so its module loads in WAMR's fast interpreter ("local count too
+  large" before). The fast interpreter also gives every distinct constant of a function a cell of its stack frame:
+  such a module needs a WAMR wasm stack of at least 256 KB (the default of iwasm is 64 KB).
+- Uncancelled output is the same as with `-7`, except the 16-byte module hash (it covers the LLVM revision) and
+  functions of more than 4,096 cells at `-Onone`. The fork commits since `-7` are listed under Source and patches.
+  The API, `JOBS.txt`, the swift-syntax version and the built-in macro module are the same as in `-7`.
+
 ## Changes in swifthost-6.4.2-7
 
 - A cancel during SIL simplification no longer aborts the process. In `-6`, a cancel that landed in the
@@ -284,6 +307,10 @@ contract. In short:
 - A stack overflow on a helper thread (8 MiB) cannot be recovered and ends the process.
 - Sendable checking of one function whose loops merge regions on every iteration still grows faster than the
   function (see Changes in swifthost-6.4.2-6).
+- A cancel does not stop one running LLVM optimization pass, CodeGenPrepare or one SIL pass on one giant function; it
+  lands when that pass ends (see the header).
+- At `-Onone`, a module with a very large function (thousands of statements) needs a WAMR wasm stack of at least
+  256 KB (see Changes in swifthost-6.4.2-8).
 
 ## Source and patches
 
@@ -291,8 +318,8 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `529a4e2687c7ac29599ef0d3258a91bda1d82deb` |
-| [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `e9a6797a92ff70f31318833c2539a129734ebe9c` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `fce936f5d677135d99c869ae8d36979343e7a65b` |
+| [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `6d8c598c2be47e43ebe2939f33678b184bfaf965` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
 | swiftlang/swift-syntax | tag `swift-6.4.2-RELEASE` | `050f1a346fbbac0ca2cfb15a95274f7bd1cf0ccf` |
@@ -356,7 +383,7 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   - `[SILOptimizer]` (`f90f8a68441`, `b2e93fae953`) SemanticARCOpts and Mem2Reg stop at their next worklist item.
   - `[IRGen]` (`547fc71f131`) IR generation stops at the next function and returns no module.
   - `[IRGen]` (`69250f0a024`) LLVM skips its remaining optional passes and stops before code generation, without
-    leaving an object file (`IRGenOptions::CancellationFlag`). Code generation itself runs to the end.
+    leaving an object file (`IRGenOptions::CancellationFlag`). Code generation stops too from `swifthost-6.4.2-8`.
   - `[Frontend][Sema]` (`cc0ed4e3825`) a cancelled compilation reports exactly one diagnostic, the fatal error
     "compilation cancelled" (no "too complex" errors from the solver, nothing reported after the cancel).
   - `[Sema][SILGen]` (`7721e874127`) code that the type checker and SIL generation type-check on demand keeps the
@@ -386,6 +413,9 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
   - `[SILOptimizer]` (`529a4e2687c`) fork only: while the compile is cancelled, the pass manager clears the pass
     invariants instead of asserting on them; the hidden option `-sil-cancel-keep-invariant-asserts` keeps the
     assertions.
+- Cancel in code generation (from `swifthost-6.4.2-8`):
+  - `[IRGen]` (`fce936f5d67`) fork only: the compilation's cancellation flag is attached around the LLVM code
+    generation pass manager, and the temporary output is discarded when the compile was cancelled.
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
@@ -407,6 +437,16 @@ The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 - `[WebAssembly]` (from `swifthost-6.4.2-3`) a cherry-pick of llvm/llvm-project `38e6c0073c42`: a call with a `byval`
   argument is never lowered as a tail call. Before, with tail calls enabled, the callee could get a pointer into the
   caller's released stack frame (for example C++ thunks that forward `std::string_view` by value).
+- `[WebAssembly]` (from `swifthost-6.4.2-8`, `175078457d42`) a cherry-pick of llvm/llvm-project `0a76568db07e`
+  (#184441): `WebAssemblyFixIrreducibleControlFlow` works on strongly connected components instead of a quadratic
+  reachability graph.
+- `[WebAssembly]` (from `swifthost-6.4.2-8`, `8acf109c7168`) fork only: at `-O0`, functions with more than 4,096
+  cells of params and locals are register-colored as at `-O` (hidden option `-wasm-o0-reg-coloring-threshold`).
+- `[WebAssembly]` (from `swifthost-6.4.2-8`, `f075680ae657`) fork only: register coloring's interference check keeps
+  one live interval union per color instead of testing every interval in it; same coloring, linear time.
+- `[CodeGen]` (from `swifthost-6.4.2-8`, `6d8c598c2be4`) fork only: a client can stop the legacy pass manager
+  part-way (`llvm/IR/CompilationCancellation.h`, a flag per LLVMContext): no further pass, function or loop runs, and
+  the long passes stop at complete points. `AsmPrinter` emits nothing after the stop.
 
 ## Licenses
 

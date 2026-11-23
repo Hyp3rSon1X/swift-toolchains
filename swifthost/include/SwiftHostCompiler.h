@@ -237,11 +237,14 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
    statement, declaration, function body or constraint-solver step; SIL
    generation before its next statement or declaration; the SIL optimizer
    before its next pass and inside the passes and analyses that take long on
-   large functions; IR generation before its next function; LLVM skips its
-   remaining optimization passes and stops before code generation. What runs to
-   the end once started: one expression's constraint generation, module
-   loading, one SIL pass on one function, and LLVM code generation of the whole
-   module (up to seconds for a function of thousands of statements). Before it
+   large functions; IR generation before its next function; LLVM before its
+   next optimization pass, and LLVM code generation (instruction selection,
+   register allocation, the WebAssembly passes and the writing of the object)
+   at its next block, instruction, function or pass, so that it, too, typically stops
+   within about 0.1 s of CPU time (up to about 0.5 s measured on a function of
+   4,000 statements). What runs to the end once started: one expression's
+   constraint generation, module loading, one SIL pass on one giant function, a
+   single running LLVM optimization pass, and CodeGenPrepare. Before it
    returns, the call frees what it built: the sendable checking of one function
    of 4,000 statements holds about 300 MB, and a cancel there returns within
    about 75 ms of CPU time. That call then returns
