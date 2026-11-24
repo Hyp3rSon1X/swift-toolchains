@@ -22,9 +22,9 @@ The stack depth then stays flat: 10,000,000 awaits and 1,000,000 actor hops run 
 
 Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except for three repositories:
 
-- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `37591f512993731dc2a9739dfb2912fdf5d17775`.
-  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus three cherry-picks and one fix of our own (the SDK `-2` was built from
-  `a9c0b4f09a79885037a86d377ccb470efee6a939`, which lacks the last one):
+- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `b906bfb4bb352e9c935b6750d23c533da9d6de70`.
+  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus four cherry-picks and two fixes of our own (the SDK `-4` was built from
+  `37591f512993731dc2a9739dfb2912fdf5d17775`, which lacks the last two):
   - `d7dcf221748b7fb3d9fbedb45fd6df20f5cc8748`, swiftlang/swift#88074, "Wasm: add tests for swiftasyncc tail calls".
     Tests only; the next pick's test edits need it.
   - `3c9966afca9c1e207dcf0b23b39971d81c3bdff6`, swiftlang/swift#93062, "[IRGen] Preserve async-context attributes in
@@ -35,6 +35,10 @@ Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except
     cooperative executor has jobs to run".
   - `37591f512993731dc2a9739dfb2912fdf5d17775`, "[Synchronization] Take the wasm Mutex as contended after waiting"
     (new in `-3`, not yet upstream). See "Changes in -3".
+  - `44bbd0de55f` (cherry-picked from `a410437bcfac6a87609f761ac8d7c3520f6085a3`), swiftlang/swift#94088, "[Runtime] Fix
+    _swift_stdlib_immortalize producing objects that revert to regular refcounting" (new in `-5`). See "Changes in -5".
+  - `b906bfb4bb352e9c935b6750d23c533da9d6de70`, "[Runtime] Define _swift_stdlib_immortalize with the C calling
+    convention" (new in `-5`, not yet upstream). See "Changes in -5".
 - `llvm-project`: Hyp3rSon1X/llvm-project, branch `hyp3r/wasm-sdk/6.4.2`,
   `11627bca6d44ea33b0fbb74d4c5c0e6c45acc087`. It is `swift-6.4.2-RELEASE` (`fb5f84d903a3`) plus three cherry-picks:
   - `b9c55a400656eb43be1215828cee8f6eaa970e94`, swiftlang/llvm-project#12648 (a squash of llvm/llvm-project#188296
@@ -113,6 +117,32 @@ wasi-libc is a static archive, so code compiled against `-3` gets the limit by r
 The regression test is `test/src/pthread_stack_limit.c` in the wasi-libc fork commit (registered for the threads
 target in `test/CMakeLists.txt`), copied here as `test/stack_limit.c`. `test/stack_limit.sh` is the SDK-level check.
 
+## Changes in -5
+
+`swifthost-sdk-wasip1-threads-6.4.2-5` fixes `_swift_stdlib_immortalize` on WebAssembly (SC-0047). swift-collections 1.7.6
+and later call it through `import SwiftShims` to make the empty `Deque` storage immortal. `RuntimeShims.h` declares it as a
+plain C function, but `RefCount.cpp` defined it with `SWIFT_CC(swift)`. The WebAssembly backend gives a `swiftcc`
+function two extra i32 parameters (`swiftself`, `swifterror`), so the definition had the type `(i32, i32, i32) -> ()`
+and the callers' import `(i32) -> ()`. wasm-ld warns "function signature mismatch" (fatal with `--fatal-warnings`);
+without the flag it replaces the call with a trap, and the program stops with `unreachable` at the first `Deque`.
+Other targets pass the same registers either way, so the mismatch was invisible there.
+
+- The definition now has the C calling convention, as the header says (`RefCount.cpp` includes `RuntimeShims.h`, so the
+  compiler checks the two against each other). Swift callers already go through the Clang importer, and swift-collections'
+  inlined call is compiled into released packages, so the header side is the one to keep.
+- swiftlang/swift#94088 (backported): `setIsImmortal` left the strong extra count at 0, so the first release fell into the
+  slow path and the object became mortal again (word `0x800000ff` to `0x7ffffeff` on wasm32). It now keeps count 2
+  (`0x800004ff`).
+- Audit: every function declared in the 26 installed `SwiftShims` headers is called from C and linked with
+  `--fatal-warnings` against all SDK archives. `-4` has one mismatch (this function), `-5` none.
+
+`-5` differs from `-4` in `libswiftCore.a` (one member, `RefCount.cpp.o`) and the two copies of `shims/RefCount.h`. Two
+more files differ without a source change: `_Differentiation.swiftmodule` (serialization order is not deterministic) and
+`libxml2-export.cmake` (written by a newer cmake). Code built against `-4` is fixed by relinking against `-5`.
+
+The regression test is `test/Runtime/immortalize.swift` in the swift fork commit, and `test/immortalize.swift` here is
+the SDK-level reproducer (swift-collections' call through `SwiftShims`, then the refcount word is checked).
+
 ## Steps (macOS arm64, Xcode 27.2, cmake and ninja on PATH)
 
 ```
@@ -167,6 +197,8 @@ The probes:
 - `stack_limit.c`: `__stack_limit` on the main thread (0) and on pthreads with default attributes, guards of 0, 8 KiB
   and 64 KiB, 64 KiB and 4 KiB `pthread_attr_setstack` buffers (the 4 KiB one gets its TLS allocated separately), and
   a detached thread, checked against `pthread_getattr_np` and the address of a local (see "Changes in -4");
+- `immortalize.swift`: `_swift_stdlib_immortalize` through `import SwiftShims`, then unbalanced releases and 1,000
+  retain/release pairs, checking that the refcount word does not change and deinit never runs (see "Changes in -5");
 - `common.swift`: progress output for the probes, written to stderr.
 
 Scripts:
@@ -182,6 +214,9 @@ Scripts:
   variants, checks with node that `__stack_limit` is an exported global, and runs it. With a `swiftc`, it also builds and
   runs `p1_taskgroup`, `p3_mutex` and a program without threads, and checks that a module exports `__stack_limit`
   exactly when it imports `wasi.thread-spawn`. It prints `stack_limit OK` when everything holds.
+- `immortalize.sh <swiftc> <threads-sdk-dir> <out-dir> <iwasm>` builds `immortalize.swift` against the SDK with a plain and
+  a `--fatal-warnings` link (no signature-mismatch warning allowed), runs both and prints `immortalize OK` when they
+  pass. On `-4` the first link warns, the second fails, and the program traps.
 - `validate.mjs <file.wasm>` compiles a module with V8. Its error names the function and the instruction, which is more
   precise than WAMR's loader message.
 
