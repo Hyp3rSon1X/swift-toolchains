@@ -22,9 +22,10 @@ The stack depth then stays flat: 10,000,000 awaits and 1,000,000 actor hops run 
 
 Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except for three repositories:
 
-- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `b906bfb4bb352e9c935b6750d23c533da9d6de70`.
-  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus four cherry-picks and two fixes of our own (the SDK `-4` was built from
-  `37591f512993731dc2a9739dfb2912fdf5d17775`, which lacks the last two):
+- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `6c40b6bc98c804e83d339a9db7e1538256dd5fbc`.
+  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus four cherry-picks and three fixes of our own (the SDK `-4` was built from
+  `37591f512993731dc2a9739dfb2912fdf5d17775`, which lacks the last three, and `-5` from
+  `b906bfb4bb352e9c935b6750d23c533da9d6de70`, which lacks the last one):
   - `d7dcf221748b7fb3d9fbedb45fd6df20f5cc8748`, swiftlang/swift#88074, "Wasm: add tests for swiftasyncc tail calls".
     Tests only; the next pick's test edits need it.
   - `3c9966afca9c1e207dcf0b23b39971d81c3bdff6`, swiftlang/swift#93062, "[IRGen] Preserve async-context attributes in
@@ -39,6 +40,8 @@ Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except
     _swift_stdlib_immortalize producing objects that revert to regular refcounting" (new in `-5`). See "Changes in -5".
   - `b906bfb4bb352e9c935b6750d23c533da9d6de70`, "[Runtime] Define _swift_stdlib_immortalize with the C calling
     convention" (new in `-5`, not yet upstream). See "Changes in -5".
+  - `6c40b6bc98c804e83d339a9db7e1538256dd5fbc`, "[Serialization] Serialize differentiability witnesses in a deterministic order" (new in `-6`,
+    not yet upstream). See "Changes in -6".
 - `llvm-project`: Hyp3rSon1X/llvm-project, branch `hyp3r/wasm-sdk/6.4.2`,
   `11627bca6d44ea33b0fbb74d4c5c0e6c45acc087`. It is `swift-6.4.2-RELEASE` (`fb5f84d903a3`) plus three cherry-picks:
   - `b9c55a400656eb43be1215828cee8f6eaa970e94`, swiftlang/llvm-project#12648 (a squash of llvm/llvm-project#188296
@@ -142,6 +145,21 @@ more files differ without a source change: `_Differentiation.swiftmodule` (seria
 
 The regression test is `test/Runtime/immortalize.swift` in the swift fork commit, and `test/immortalize.swift` here is
 the SDK-level reproducer (swift-collections' call through `SwiftShims`, then the refcount word is checked).
+
+## Changes in -6
+
+`swifthost-sdk-wasip1-threads-6.4.2-6` makes every Swift module of the SDK byte-reproducible (SC-0048). The compiler
+collected the differentiability witnesses to serialize in a hash set keyed by pointer and wrote them in iteration
+order, so their order (and the order of the functions and type IDs they reference) followed heap addresses and changed
+from run to run. Only `_Differentiation.swiftmodule` has witnesses, so it was the one SDK module that came out
+different on every build; all others were already identical. The compiler now writes the witnesses in insertion order.
+
+- `-6` differs from `-5` in the two copies of `_Differentiation.swiftmodule` only (same size, same content, stable
+  record order). Every other file of the bundle, including `libswiftCore.a`, is identical to `-5`.
+- Rebuilding the whole SDK from scratch a second time with the same compiler gives a byte-identical bundle and an
+  identical zip. The `.swiftinterface` files and the C and C++ libraries were already reproducible.
+- The regression test is `test/AutoDiff/Serialization/differentiability_witness_determinism.swift` in the swift fork
+  commit (`-emit-module -enable-deterministic-check`).
 
 ## Steps (macOS arm64, Xcode 27.2, cmake and ninja on PATH)
 
