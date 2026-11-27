@@ -156,14 +156,14 @@ stack ended in an unrelated trap in WAMR; with `--stack-first` the same
 program trapped with "out of bounds memory access" at the overflow.
 `--global-base` must be at least the stack size in this mode.
 
-C compile jobs (swifthost_clang)
---------------------------------
+C and C++ compile jobs (swifthost_clang)
+----------------------------------------
 
-The C targets of a package (C only for now; C++ is untested) compile one
-source file per call into one object, which then goes on the wasm-ld line
-after $OBJ. This is the line SwiftPM runs for a C file, plus -resource-dir
-(argv[0] is no real path in the app, so clang cannot find its headers next
-to it); for the threads SDK (wasm32-unknown-wasip1-threads):
+The C and C++ targets of a package compile one source file per call into one
+object, which then goes on the wasm-ld line after $OBJ. This is the line
+SwiftPM runs for a C or C++ file, plus -resource-dir (argv[0] is no real
+path in the app, so clang cannot find its headers next to it); for the
+threads SDK (wasm32-unknown-wasip1-threads):
 
   clang
   -target wasm32-unknown-wasip1-threads
@@ -181,12 +181,28 @@ to it); for the threads SDK (wasm32-unknown-wasip1-threads):
   -c <file>.c
   -o <file>.c.o
 
+A C++ file gets the same line (SwiftPM also runs "clang" for it, and repeats
+the toolset flags and -g; harmless) plus -std=c++17 (or the package's
+cxxLanguageStandard) before -c, with <file>.cpp, <file>.cpp.d and
+<file>.cpp.o. The driver finds libc++'s headers through --sysroot
+(WASI.sdk/include/c++/v1, which the app must ship); the wasm-ld line already
+has -lc++ -lc++abi. The SDK's libc++abi has no exception runtime, and C++
+exceptions are on by default: a target that throws or uses a throwing part of
+libc++ (std::map::at, std::function, ...) links only when compiled with
+-fno-exceptions (cxxSettings: [.unsafeFlags(["-fno-exceptions"])] in its
+manifest; a "throw" in its own code is then a compile error). Swift's C++
+interoperability (-cxx-interoperability-mode) is not covered: Swift calls a
+C++ target through a C header (extern "C"), as with a C target.
+
 Debug builds may add -index-store-path <dir> (SwiftPM does). -target (a
 WebAssembly target), --sysroot and -resource-dir are required (without
 -target the library compiles for wasm32-unknown-wasip1, never for the host;
-a missing -resource-dir is an error). Inputs: C sources (.c, -x c) and
-preprocessed C (.i, -x cpp-output) only; argv[0] must be "clang" (not
-"clang++"). One call runs exactly one compile job: two source files with -c
+a missing -resource-dir is an error). Inputs: C sources (.c, -x c),
+preprocessed C (.i, -x cpp-output), C++ sources (.cc, .cp, .cpp, .cxx, .c++,
+.C, .CC, .CPP, .CXX, .C++, -x c++) and preprocessed C++ (.ii, -x c++-cpp-output) only; no headers,
+header units or C++20 module units (.cppm, ...). argv[0] is "clang" or
+"clang++" (g++ mode, which compiles .c files as C++; --driver-mode=g++ is the
+same). One call runs exactly one compile job: two source files with -c
 and a command without -c (it would link) are errors (return value 1).
 `-###` writes the cc1 command line to err_fd and runs nothing; argv[0]
 "clang", argv[1] "-cc1" and the rest of that line run it directly. Response
@@ -198,11 +214,16 @@ print to the process's stdout or stderr (-v, --version, -help, -print-*,
 options), that run more than the compile (-save-temps), that load code
 (-fplugin=, -fpass-plugin=, -Xclang -load/-plugin/-add-plugin), GPU
 offloading (--offload-arch=, CUDA, HIP, -fopenmp (-fopenmp-simd is fine),
-SYCL), -ObjC,
---driver-mode=, configuration files (--config), -MJ, -fno-temp-file,
--ftime-trace and the compilation cache. The full list is in
+SYCL), -ObjC, -ObjC++,
+--driver-mode= other than gcc and g++, clang modules and C++20 modules
+(-fmodules, -fcxx-modules, -fmodule*, -fmodules-*, -fimplicit-module-maps,
+-fprebuilt-module-path=, --precompile, ...), precompiled headers
+(-include-pch, or an -include whose .pch/.gch exists), configuration files
+(--config), -MJ, -fno-temp-file, -ftime-trace and the compilation cache. The full list is in
 SwiftHostCompiler.h; -Xclang passes other cc1 options through unchecked, so
-pass only cc1 options that you have tested. With the same compiler sources
+pass only cc1 options that you have tested. Module imports in the source
+(import, @import, #pragma clang module import) and #pragma clang module build
+fail with one error line too. With the same compiler sources
 and flags the objects are byte-identical to the stand-alone clang's.
 
 Running the output

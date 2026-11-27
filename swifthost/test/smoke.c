@@ -24,6 +24,7 @@
  */
 #include "SwiftHostCompiler.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -508,11 +509,15 @@ static void checkExecutablePlugins(void) {
   }
 }
 
-/* One C file through swifthost_clang (the C targets of a package). */
-static int clangCompile(const char *src, const char *obj, const char *inc, const char *opt,
-                        const char *tag, char **diag) {
+/* One C or C++ file through swifthost_clang (the C and C++ targets of a
+   package): argv[0] "clang" or "clang++", then extra (NULL-terminated, may be
+   NULL) before the common arguments. */
+static int clangCompileAs(const char *argv0, const char **extra, const char *src, const char *obj,
+                          const char *inc, const char *opt, const char *tag, char **diag) {
   Args a = {0};
-  add(&a, "clang");
+  add(&a, argv0);
+  for (; extra && *extra; ++extra)
+    add(&a, *extra);
   add(&a, "-target"); add(&a, "wasm32-unknown-wasip1");
   add(&a, "--sysroot"); add(&a, fmt("%s/WASI.sdk", SDK));
   add(&a, "-resource-dir"); add(&a, fmt("%s/clang", SW));
@@ -524,7 +529,21 @@ static int clangCompile(const char *src, const char *obj, const char *inc, const
   return call(swifthost_clang, &a, tag, diag);
 }
 
+static int clangCompile(const char *src, const char *obj, const char *inc, const char *opt,
+                        const char *tag, char **diag) {
+  return clangCompileAs("clang", NULL, src, obj, inc, opt, tag, diag);
+}
+
+/* C++ as SwiftPM compiles a package's C++ target for this SDK, with
+   -fno-exceptions: the SDK's libc++abi has no exception runtime. */
+static int clangCxxCompile(const char *src, const char *obj, const char *inc, const char *opt,
+                           const char *tag, char **diag) {
+  const char *extra[] = {"-std=c++17", "-fno-exceptions", NULL};
+  return clangCompileAs("clang++", extra, src, obj, inc, opt, tag, diag);
+}
+
 static const char *CLANG_EXPECT = "c says 42\n";
+static const char *CXX_EXPECT = "c++ says 42\n";
 
 /* swifthost_clang: a C module (header, module map, source) compiled
    in-process, imported by a Swift main and linked with it; then a clang call
@@ -589,6 +608,166 @@ static void checkClang(void) {
   rc = clangCompile(src, obj, inc, "-O2", "clang-after-cancel", &diag);
   printf("%-24s rc %3d\n", "clang-after-cancel", rc);
   CHECK(rc == 0, "clang call after a cancelled one: rc %d", rc);
+}
+
+/* swifthost_clang with C++ (argv[0] "clang++"): a C++ source behind a C
+   header (libc++ containers, a template, a virtual class with dynamic_cast, a
+   global constructor), imported by a Swift main and linked with it and the
+   SDK's libc++/libc++abi; then a C++ call cancelled after 400 ms of its CPU
+   time, while it instantiates templates at the end of the file (parsing
+   <map> takes about 200 ms, the 150 std::map specializations several
+   seconds), which must return within the same bound as a C call, and a C++
+   call after it. */
+static void checkClangCxx(void) {
+  char *dir = fmt("%s/cxxmod", WORK), *inc = fmt("%s/cxxmod/include", WORK);
+  mkdir(dir, 0755);
+  mkdir(inc, 0755);
+  writeFile(fmt("%s/cxxops.h", inc),
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint cxx_answer(void);\n"
+            "#ifdef __cplusplus\n}\n#endif\n");
+  writeFile(fmt("%s/module.modulemap", inc), "module CxxOps {\n  header \"cxxops.h\"\n  export *\n}\n");
+  char *src = fmt("%s/cxxops.cpp", dir), *obj = fmt("%s/cxxops.o", dir);
+  writeFile(src,
+            "#include \"cxxops.h\"\n#include <map>\n#include <memory>\n#include <numeric>\n"
+            "#include <string>\n#include <vector>\n"
+            "namespace {\n"
+            "struct Base { virtual ~Base() = default; virtual int value() const = 0; };\n"
+            "struct Six : Base { int value() const override { return 6; } };\n"
+            "struct Counter { int n; Counter() : n(7) {} };\n"
+            "Counter counter;\n"
+            "template <typename T> T sum(const std::vector<T> &v) { return std::accumulate(v.begin(), v.end(), T()); }\n"
+            "}\n"
+            "extern \"C\" int cxx_answer(void) {\n"
+            "  std::map<std::string, int> m{{\"a\", 1}, {\"b\", 2}};\n"
+            "  std::unique_ptr<Base> b(new Six);\n"
+            "  int six = dynamic_cast<Six *>(b.get()) ? b->value() : 0;\n"
+            "  return sum(std::vector<int>{m[\"a\"], m[\"b\"], six}) + counter.n * 4 + 5;\n"
+            "}\n");
+  char *diag = NULL;
+  double t0 = nowMs();
+  int rc = clangCxxCompile(src, obj, inc, "-O2", "cxx-ops", &diag);
+  printf("%-24s rc %3d  clang++ %6.0f ms\n", "cxx-ops", rc, nowMs() - t0);
+  CHECK(rc == 0 && diag && !*diag, "clang++: rc %d, diagnostics: %s", rc, diag ? diag : "(null)");
+
+  char *mainSrc = fmt("%s/cxxmain.swift", dir);
+  writeFile(mainSrc, "import CxxOps\nprint(\"c++ says\", cxx_answer())\n");
+  const char *incArgs[] = {"-I", inc, NULL};
+  const char *objs[] = {obj, NULL};
+  Build b = buildObjs(mainSrc, "cxx-swift-main", incArgs, objs);
+  report("cxx-swift-main", &b);
+  CHECK(b.rc == 0, "Swift main with the C++ module failed");
+  if (!b.rc) {
+    char *out = runWasm("cxx-swift-main");
+    CHECK(!out || !strcmp(out, CXX_EXPECT), "cxx-swift-main output %s", out);
+  }
+
+  char *tmpl = fmt("%s/tmpl.cpp", dir), *tmplObj = fmt("%s/tmpl.o", dir);
+  FILE *f = fopen(tmpl, "w");
+  fprintf(f, "#include <map>\n"
+             "template <int N> struct Key { unsigned v; bool operator<(const Key &o) const { return v < o.v; } };\n"
+             "template <int N> unsigned useMap(unsigned x) {\n"
+             "  std::map<Key<N>, unsigned> m;\n"
+             "  for (unsigned i = 0; i < (x & 15u) + 4u; ++i) m[Key<N>{i * N + x}] = i;\n"
+             "  unsigned s = 0;\n  for (const auto &kv : m) s += kv.first.v ^ kv.second;\n"
+             "  return s + useMap<N - 1>(x);\n}\n"
+             "template <> unsigned useMap<0>(unsigned x) { return x; }\n"
+             "unsigned entry(unsigned x) { return useMap<150>(x); }\n");
+  fclose(f);
+  writeFile(tmplObj, "OLD OBJECT\n");
+  CpuCancelCtx cc = {.cpuMs = 400, .thread = pthread_mach_thread_np(pthread_self())};
+  atomic_init(&cc.done, 0);
+  pthread_t ct;
+  pthread_create(&ct, NULL, cpuCanceller, &cc);
+  t0 = nowMs();
+  rc = clangCxxCompile(tmpl, tmplObj, inc, "-O0", "cxx-cancelled", &diag);
+  double returnedAt = nowMs(), cpuAtReturn = threadCpuMs(cc.thread);
+  atomic_store(&cc.done, 1);
+  pthread_join(ct, NULL);
+  int fired = cc.requestedAt > 0 && cc.requestedAt <= returnedAt;
+  printf("%-24s rc %3d  clang++ %6.0f ms\n", "cxx-cancelled", rc, returnedAt - t0);
+  if (fired)
+    printf("  cancel latency %.0f ms, %.0f ms of CPU\n", returnedAt - cc.requestedAt, cpuAtReturn - cc.cpuAtRequest);
+  CHECK(fired, "cancelled C++ call: the call returned before the cancel was requested");
+  CHECK(rc == SWIFTHOST_ECANCELED, "cancelled C++ call: rc %d (expected %d)", rc, SWIFTHOST_ECANCELED);
+  CHECK(rc != SWIFTHOST_ECANCELED || onlyCancellation(diag),
+        "cancelled C++ call: diagnostics other than \"compilation cancelled\":\n%s", diag);
+  char *old = readFile(tmplObj);
+  CHECK(old && !strcmp(old, "OLD OBJECT\n"), "cancelled C++ call changed the object at its -o path");
+  CHECK(!fired || returnedAt - cc.requestedAt < 500, "C++ cancel took %.0f ms (bound 500 ms)",
+        returnedAt - cc.requestedAt);
+
+  rc = clangCxxCompile(src, obj, inc, "-O2", "cxx-after-cancel", &diag);
+  printf("%-24s rc %3d\n", "cxx-after-cancel", rc);
+  CHECK(rc == 0, "C++ call after a cancelled one: rc %d", rc);
+}
+
+/* The directory LLVM creates temporary files in (llvm::sys::path::
+   system_temp_directory): $TMPDIR, $TMP, $TEMP, $TEMPDIR, else the user's
+   Darwin temporary directory. */
+static char *tempDir(void) {
+  const char *names[] = {"TMPDIR", "TMP", "TEMP", "TEMPDIR"};
+  for (int i = 0; i < 4; ++i)
+    if (getenv(names[i]) && *getenv(names[i]))
+      return fmt("%s", getenv(names[i]));
+  char buf[PATH_MAX];
+  size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof buf);
+  return fmt("%s", n > 0 && n <= sizeof buf ? buf : "/tmp");
+}
+
+/* The number of entries of dir whose name starts with prefix. */
+static int countEntries(const char *dir, const char *prefix) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return -1;
+  int n = 0;
+  for (struct dirent *e; (e = readdir(d));)
+    n += !strncmp(e->d_name, prefix, strlen(prefix));
+  closedir(d);
+  return n;
+}
+
+/* "#pragma clang module build" in a C, C++17 and C++20 source: the stand-alone
+   clang compiles a nested module from it into a .pcm file in $TMPDIR (and,
+   in C++20, accepts the source); swifthost_clang must fail the call with one
+   line, create no file there, and compile normally afterwards. */
+static void checkClangModuleBuild(void) {
+  char *dir = fmt("%s/cxxmod", WORK), *inc = fmt("%s/cxxmod/include", WORK);
+  char *tmp = tempDir();
+  const char *module = "SwiftHostSmokePragmaModule";
+  const char *body = "#pragma clang module build SwiftHostSmokePragmaModule\n"
+                     "module SwiftHostSmokePragmaModule {}\n#pragma clang module contents\n"
+                     "#pragma clang module begin SwiftHostSmokePragmaModule\n"
+                     "int pragma_module_answer(void) { return 1; }\n"
+                     "#pragma clang module end\n#pragma clang module endbuild\n"
+                     "int pragma_module_main(void) { return 0; }\n";
+  const char *c17[] = {"-std=c++17", "-fno-exceptions", NULL};
+  const char *c20[] = {"-std=c++20", "-fno-exceptions", NULL};
+  struct { const char *tag, *argv0, **extra, *ext; } cases[] = {
+      {"pragma-module-build-c", "clang", NULL, "c"},
+      {"pragma-module-build-cxx17", "clang++", c17, "cpp"},
+      {"pragma-module-build-cxx20", "clang++", c20, "cpp"},
+  };
+  for (int i = 0; i < 3; ++i) {
+    char *src = fmt("%s/%s.%s", dir, cases[i].tag, cases[i].ext), *obj = fmt("%s/%s.o", dir, cases[i].tag);
+    writeFile(src, body);
+    int before = countEntries(tmp, module);
+    char *diag = NULL;
+    int rc = clangCompileAs(cases[i].argv0, cases[i].extra, src, obj, inc, "-O2", cases[i].tag, &diag);
+    int after = countEntries(tmp, module);
+    int lines = 0;
+    for (const char *c = diag; c && *c; ++c)
+      lines += *c == '\n';
+    printf("%-24s rc %3d  lines %d  new in TMPDIR %d\n", cases[i].tag, rc, lines, after - before);
+    CHECK(rc == 1 && lines == 1 && strstr(diag, "error: swifthost_clang does not support #pragma clang module build"),
+          "%s: rc %d, diagnostics:\n%s", cases[i].tag, rc, diag ? diag : "(null)");
+    CHECK(before >= 0 && after == before, "%s: %d new %s* files in %s", cases[i].tag, after - before, module, tmp);
+    CHECK(access(obj, F_OK) != 0, "%s: the failed call wrote %s", cases[i].tag, obj);
+  }
+  char *src = fmt("%s/cxxops.cpp", dir), *obj = fmt("%s/cxxops.o", dir), *diag = NULL;
+  int rc = clangCxxCompile(src, obj, inc, "-O2", "cxx-after-pragma", &diag);
+  printf("%-24s rc %3d\n", "cxx-after-pragma", rc);
+  CHECK(rc == 0 && diag && !*diag, "C++ call after the module pragmas: rc %d, diagnostics: %s", rc,
+        diag ? diag : "(null)");
 }
 
 static void *worker(void *unused) {
@@ -826,6 +1005,8 @@ static void *worker(void *unused) {
   }
 
   checkClang();
+  checkClangCxx();
+  checkClangModuleBuild();
 
   snap(&after);
   snapDiff(&before, &after, "after the builds");

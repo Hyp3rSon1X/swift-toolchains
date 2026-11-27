@@ -10,7 +10,8 @@ It compiles against the official swift.org Swift SDK for WebAssembly, `swift-6.4
 or downloads itself. Programs can use the standard library, Foundation (FoundationEssentials,
 FoundationInternationalization), Observation's runtime, Synchronization, RegexBuilder and the other modules in that
 SDK. Macros work through an in-process plugin server that the app provides (see Macros). Since -9 it also compiles
-the C targets of packages to WebAssembly objects (`swifthost_clang`, see C targets).
+the C targets of packages to WebAssembly objects (`swifthost_clang`), since -10 their C++ targets too (see C and C++
+targets).
 
 ## Contents
 
@@ -56,7 +57,7 @@ See `SwiftHostCompiler.h` for the contract and `JOBS.txt` for the jobs. In short
 
 1. Run every call on a thread with at least `SWIFTHOST_MIN_STACK_SIZE` (16 MiB) of stack, not on the main thread.
 2. Compile with `swifthost_swift_frontend`, extract the autolink entries with `swifthost_swift_autolink_extract`,
-   link with `swifthost_wasm_ld`; compile the C sources of package C targets with `swifthost_clang`. Each takes an argv and two file descriptors (output, diagnostics) and returns the
+   link with `swifthost_wasm_ld`; compile the C and C++ sources of package C and C++ targets with `swifthost_clang`. Each takes an argv and two file descriptors (output, diagnostics) and returns the
    tool's exit status.
 3. Pass `-module-cache-path` to a writable directory that survives between builds (for example in Caches).
 4. If a call returns `SWIFTHOST_EPOISONED` (125), the compiler crashed in this process (in this call or an earlier
@@ -132,17 +133,54 @@ awaits still overflow the stack.
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
 
-## C targets
+## C and C++ targets
 
-`swifthost_clang` (since -9) compiles one C source file per call to a WebAssembly object with the library's clang,
-for the C targets of packages (for example `_NumericsShims`, `_AtomicsShims`, swift-markdown's `CAtomic` and
-`cmark-gfm`, swift-syntax's `_SwiftSyntaxCShims`). It takes clang driver arguments for exactly one compile job, as
-SwiftPM's native build system passes them, plus `-resource-dir` (the SDK's `swift_static/clang`) and the toolset's C
-flags; `JOBS.txt` has the full argument list under "C compile jobs" and the header the contract. With the same
-sources and flags the objects are byte-identical to the stand-alone clang's. Only C and preprocessed C are accepted:
-C++, Objective-C, assembler and LLVM IR inputs, options that spawn, load code or write to the process's standard
-streams, and commands that need more than one job are rejected with one error line. A running call is cancelled by
-`swifthost_request_cancel()` like a frontend call.
+`swifthost_clang` (since -9; C++ since -10) compiles one C or C++ source file per call to a WebAssembly object with
+the library's clang, for the C and C++ targets of packages (for example `_NumericsShims`, `_AtomicsShims`,
+swift-markdown's `CAtomic` and `cmark-gfm`, swift-syntax's `_SwiftSyntaxCShims`; in C++ `_FoundationICU`, zxing-cpp's
+`ZXingCppCore`, `simdjson`, `immer`). It takes clang driver arguments for exactly one compile job, as SwiftPM's native
+build system passes them (SwiftPM runs `clang` for C++ files too; `clang++` works as well), plus `-resource-dir` (the
+SDK's `swift_static/clang`) and the toolset's flags; `JOBS.txt` has the full argument list under "C and C++ compile
+jobs" and the header the contract. With the same sources and flags the objects are byte-identical to the stand-alone
+clang's. Accepted are C, C++ and their preprocessed forms; headers, C++20 module units, Objective-C(++), assembler and
+LLVM IR inputs, clang and C++20 modules (options and module pragmas or imports in the source),
+precompiled headers, options that spawn, load code or write to the process's standard streams,
+and commands that need more than one job are rejected with one error line. A running call is cancelled by
+`swifthost_request_cancel()` like a frontend call, in C++ also while templates are instantiated.
+
+C++ targets reach Swift through a C header (`extern "C"`), like C targets; Swift's C++ interoperability
+(`-cxx-interoperability-mode`) is not covered. The app must ship the SDK's `WASI.sdk/include/c++/v1` (libc++'s
+headers, found through `--sysroot`) and link `-lc++ -lc++abi`, which the Swift link line already does. The SDK's
+libc++abi has no exception runtime, while clang turns C++ exceptions on by default: a target that throws, or uses a
+throwing part of libc++ (`std::map::at`, `std::function`, ...), links only when compiled with `-fno-exceptions`.
+
+## Changes in swifthost-6.4.2-10
+
+- `swifthost_clang` compiles C++ too (see C and C++ targets): C++ and preprocessed C++ inputs, argv[0] `clang++` and
+  `--driver-mode=g++` besides `clang`, libc++ from the SDK through `--sysroot`. No compiler change: clang's C++ front
+  end was already in the library. Still rejected: headers, header units and C++20 module units, and now for C and
+  C++ alike every clang-modules and C++20-modules option (`-fmodules`, `-fmodule-*`, `-fmodules-*`,
+  `-fimplicit-module-maps`, `-fprebuilt-module-path=`, `--precompile`, ...) and the driver modes other than gcc and g++.
+  Module requests in the source fail with one error line, without writing a file: `#pragma clang module build` (which
+  compiled a nested module into a `.pcm` file in `$TMPDIR`, outside the call's cancellation) and module imports
+  (`import`, `@import`, `#pragma clang module import`/`load`). Precompiled headers (`-include-pch`, or an `-include`
+  whose `.pch`/`.gch` file exists) are rejected.
+- Cancellation in C++: a cancel during template instantiation, inside a declaration or at the end of the file, now
+  stops all further instantiation (the call reports the cancel as before and also puts clang's diagnostics into the
+  state after a fatal error, in which Sema instantiates nothing more). Measured median 14-18 ms from the request to
+  the return (CPU time) while 250 `std::map` specializations are instantiated at the end of a file, where the C-only
+  checks of -9 took 1.7-1.9 s (up to 2.8 s). The IR generation at the end of a C++ file still runs to its end (up to
+  about 0.5 s measured).
+- Tested with the C++ targets `_FoundationICU` (swift-foundation-icu swift-6.4.2-RELEASE, 476 files), `ZXingCppCore`
+  (zxing-cpp v3.2.0, 104 C++ files and 1 C file), `simdjson` (simdjson-spm 4.6.4), `immer` (v0.9.1) and a reference
+  package (4 files): SwiftPM 6.4.2's lines for the `swifthost-sdk-wasip1-threads-6.4.2-6` SDK, debug and release
+  (1,174 compiles), three passes in one process, the third interleaved with the 62 C lines of -9 and a Swift
+  compile: objects and dependency files byte-identical to the stand-alone clang built from the same sources. The
+  reference package's Swift program (global constructors, RTTI, containers, `std::thread`) and an ICU caller
+  (`u_strToUpper`, `ucol_strcoll`) link in-process and run in WAMR. ICU's data file `icu_packaged_data.cpp` takes
+  about 17 s and a peak of about 8 GB of memory to compile, in-process as with the stand-alone clang.
+- The Swift compiler, sourcekitd, wasm-ld and the C path are unchanged from -9 (same fork commits, same objects for
+  the C lines).
 
 ## Changes in swifthost-6.4.2-9
 
@@ -286,7 +324,8 @@ removed, the smoke test still passes (164 MiB, 1,125 files left):
   `swift_static` (`-use-static-resource-dir`).
 - every `*.swiftinterface`: the binary `.swiftmodule`s load directly, and no module is rebuilt into the module cache.
 - every `*.swiftdoc` (documentation comments; opened when present, not needed).
-- `WASI.sdk/include/c++` (libc++ headers; only needed for C++ interoperability, which the jobs do not enable).
+- `WASI.sdk/include/c++` (libc++ headers), but only if the app compiles no C++ with `swifthost_clang` (since -10;
+  the smoke test's C++ case needs it, and `test/sdk-access-smoke.txt` was recorded before that case existed).
 
 `test/sdk-access-smoke.txt` lists every SDK file that the smoke test's programs opened or checked for (recorded with
 `test/fsaccess.c`). Keep files that are only checked for (`probe`), such as headers named in module maps: clang
@@ -322,7 +361,8 @@ contract. In short:
 ## Limits
 
 - One call at a time per process (calls are serialized internally).
-- `swifthost_clang` compiles C only (C++ is planned), one source file per call.
+- `swifthost_clang` compiles C and C++ (no Objective-C, no headers or C++20 module units), one source file per
+  call; C++ code that throws needs an exception runtime the SDK does not have (see C and C++ targets).
 - No macro implementations are included (`@Observable`, `#Predicate`, `#expect`, ...): the app serves them (see
   Macros). A macro whose module no plugin serves is an ordinary compile error (return value 1), for example:
   `error: external macro implementation type 'ObservationMacros.ObservableMacro' could not be found for macro

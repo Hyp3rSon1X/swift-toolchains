@@ -232,27 +232,56 @@ const char *swifthost_version(void);
 int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
                              int err_fd);
 
-/* Compiles one C source file with the library's clang, for the C targets of
-   packages. argv[0] = "clang" (its stem prefixes the driver's diagnostics;
-   names that select another driver mode, such as "clang++" or "clang-cl",
-   are rejected), then clang driver arguments for exactly one compile job,
-   for example:
+/* Compiles one C or C++ source file with the library's clang, for the C and
+   C++ targets of packages (C++ targets that offer Swift a C API; Swift's C++
+   interoperability, -cxx-interoperability-mode, is not covered). argv[0] =
+   "clang" or "clang++" (g++ mode, as --driver-mode=g++ selects it; its stem
+   prefixes the driver's diagnostics; names that select another driver mode,
+   such as "clang-cl" or "clang-cpp", are rejected), then clang driver
+   arguments for exactly one compile job, for example:
      clang -target wasm32-unknown-wasip1-threads --sysroot <SDK>/WASI.sdk
            -resource-dir <SDK>/swift.xctoolchain/usr/lib/swift_static/clang
            -O2 -c x.c -o x.o -MD -MF x.d
-   or argv[1] = "-cc1" followed by cc1 arguments (as -### prints them).
-   Response files (@file) are expanded first. Same contract as
-   swifthost_swift_frontend: serialized with the other calls, crash recovery
-   and poisoning, return value 0, 1 (an error, with diagnostics on err_fd),
-   SWIFTHOST_ECANCELED, SWIFTHOST_EPOISONED or 128 + signal; out_fd is unused.
-   An LLVM fatal error is reported on err_fd as "error: fatal error in the C
-   compiler: <reason>".
+   (SwiftPM compiles C++ files with "clang" too, adding -std=c++17 or the
+   package's standard), or argv[1] = "-cc1" followed by cc1 arguments (as
+   -### prints them). Response files (@file) are expanded first. Same contract
+   as swifthost_swift_frontend: serialized with the other calls, crash
+   recovery and poisoning, return value 0, 1 (an error, with diagnostics on
+   err_fd), SWIFTHOST_ECANCELED, SWIFTHOST_EPOISONED or 128 + signal; out_fd
+   is unused. An LLVM fatal error is reported on err_fd as "error: fatal error
+   in the C compiler: <reason>" (C++ too).
 
-   Inputs: C sources (.c, -x c) and preprocessed C (.i, -x cpp-output) only.
-   Every other input (LLVM IR, assembler, C++, Objective-C, headers and
-   precompiled headers, CUDA, HIP, files of unknown type, which the driver
+   Inputs: C sources (.c, -x c), preprocessed C (.i, -x cpp-output), C++
+   sources (.cc, .cp, .cpp, .cxx, .c++, .C, .CC, .CPP, .CXX, .C++, -x c++;
+   in g++ mode .c files compile as C++, with the driver's deprecation
+   warning) and preprocessed C++ (.ii, -x c++-cpp-output) only. Every other input (LLVM IR, assembler,
+   Objective-C and Objective-C++, C and C++ headers, header units and
+   precompiled headers, C++20 module units (.cppm, .ccm, .cxxm, .c++m,
+   -x c++-module), OpenCL, CUDA, HIP, files of unknown type, which the driver
    would link, and "-" for standard input) is rejected before the driver
-   runs, and the job's input is checked again afterwards.
+   runs, and the job's input is checked again afterwards. A .cpp file that
+   declares a C++20 module (export module M;) compiles to its object only,
+   as with the stand-alone clang; no module file is written. Module imports
+   in the source (C++20 import, @import, #pragma clang module import and
+   load) and #pragma clang module build (which the stand-alone clang compiles
+   into a nested module, written to $TMPDIR) fail with one line, "error:
+   swifthost_clang does not support module imports" or "... does not support
+   #pragma clang module build", without a source location; clang stops
+   reading the file there (as after a module that fails to load), nothing is
+   reported after it (no "1 error generated."), and no file is written.
+
+   C++: the driver adds the SDK's libc++ headers from --sysroot
+   (WASI.sdk/include/wasm32-wasip1-threads/c++/v1 and
+   WASI.sdk/include/c++/v1, the same -internal-isystem set as the
+   stand-alone clang++), so the app must ship WASI.sdk/include/c++/v1, and the
+   link must add -lc++ -lc++abi (the Swift link line already does). C++
+   exceptions are on by default, as with the stand-alone clang, but the SDK's
+   libc++abi has no exception runtime: code that throws, or that uses the
+   throwing parts of libc++ (std::map::at, std::function's call operator,
+   std::vector::at, ...), compiles but does not link (__cxa_throw and
+   __cxa_allocate_exception are undefined). Such targets need
+   -fno-exceptions, with which libc++ aborts instead of throwing and a
+   "throw" in the target's own code is a compile error.
 
    Required: -target, a WebAssembly target (without it the call compiles for
    wasm32-unknown-wasip1, never for the host; other targets are rejected),
@@ -260,7 +289,7 @@ int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
    found) and -resource-dir (clang's own headers; argv[0] is no real path in
    the app, so clang cannot find them next to it, and a call without
    -resource-dir is an error). The threads SDK
-   (wasm32-unknown-wasip1-threads) also needs its toolset's C flags:
+   (wasm32-unknown-wasip1-threads) also needs its toolset's C and C++ flags:
    -matomics -mbulk-memory -mthread-model posix -pthread
    -ftls-model=local-exec (and -mtail-call for the tail-call bundle).
 
@@ -304,20 +333,44 @@ int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
      -fopenmp* options except -fopenmp-simd and -fno-openmp-simd (the SDK
      has no OpenMP runtime either), -fsycl*, -Xopenmp-target, -Xoffload-linker, -Xcuda-*,
      -Xarch_device).
-   - Options that change the language or the driver (-ObjC, -ObjC++,
-     --driver-mode=), configuration files (--config, --config-system-dir=,
-     --config-user-dir=; default configuration files are never read) and
-     compilation databases (-MJ).
+   - Options that change the language or the driver (-ObjC, -ObjC++, and
+     --driver-mode= other than gcc and g++: cl, cpp, flang, dxc, cache; the
+     last --driver-mode= counts, as for the driver), configuration files
+     (--config, --config-system-dir=, --config-user-dir=; default
+     configuration files are never read) and compilation databases (-MJ).
+   - Clang modules and C++20 modules, which build modules implicitly (on
+     helper threads, into a module cache) or read or write module files, for
+     C and C++ alike: -fmodules, -fcxx-modules, every -fmodule* and
+     -fmodules-* option (-fmodule-file=, -fmodule-output, -fmodule-output=,
+     -fmodule-map-file=, -fmodule-name=, -fmodule-header, -fmodule-header=,
+     -fmodules-cache-path=, -fmodules-reduced-bmi, ...),
+     -fimplicit-module-maps, -fprebuilt-module-path=,
+     -fprebuilt-implicit-modules, -fbuiltin-module-map, --precompile and
+     -fexperimental-modules-reduced-bmi; at cc1 level -fmodules,
+     -fcxx-modules, -fmodule-file=, -fprebuilt-module-path=,
+     -fmodule-output=, -fmodule-map-file=, -fimplicit-module-maps and
+     -fmodules-cache-path= (-fno-modules and -fno-implicit-modules are
+     fine).
+   - Precompiled headers: -include-pch, an -include whose .pch or .gch file
+     exists next to the header (the driver turns it into -include-pch), and
+     at cc1 level -include-pch and -chain-include.
    - -fno-temp-file (it writes the object in place, so a failed or cancelled
      call would delete an older one), process-wide profiling (-ftime-trace),
      the compilation cache (-fcache-compile-job) and the frontend actions
      that wrap the compile (-fixit-recompile, -emit-symbol-graph,
-     -ast-merge). Other cc1 actions (-ast-dump, -emit-pch, ...) fail with an
-     error.
+     -ast-merge). Other cc1 actions (-ast-dump, -ast-print, -emit-pch,
+     -emit-module-interface, -emit-header-unit, ...) fail with an error.
    -mllvm options go to LLVM's process-global option parser as -Xllvm does
    for the frontend (the next call resets them); an unknown one fails the
    call with the parser's message on err_fd, but -mllvm -help and -mllvm
    -version end it through LLVM's exit path (process stdout, poisoned).
+
+   One known exception writes to the process's stderr: the debugging
+   pragmas "#pragma clang __debug" dump, macro, module_map, module_lookup,
+   modules and diag_mapping (clang prints them with llvm::errs() or
+   dump()), unless the call returns before it reaches them. ("#pragma clang
+   __debug crash" and llvm_fatal_error end the call as other crashes and LLVM
+   fatal errors do.)
 
    Diagnostics go to err_fd: the driver's ("clang: error: ..."), the
    compiler's ("file:line:column: error: ...", then "N errors generated."),
@@ -335,6 +388,26 @@ int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
    freeing included, two runs): medians of about 10-40 ms while parsing and
    in code generation and 100-170 ms in optimization, up to about 0.5 s
    when one optimization pass works on one function of 20,000 statements.
+   In C++ the call also checks whenever semantic analysis finishes a class
+   template instantiation, requests or finishes a function template
+   instantiation, defines an inline function or uses a vtable, and a cancel
+   there stops all further template instantiation: inside one declaration,
+   and the instantiations that are pending at the end of the file
+   (implicit instantiations of function templates and of the members of
+   class templates, which in C++ are often most of the work). What still
+   runs to the end after a cancel: the instantiation in progress (one
+   function or class), a constant evaluation in progress (bounded by
+   -fconstexpr-steps), then the end of the file without further
+   instantiation; the IR generation at the end of the file, which in C++
+   emits all inline and template functions (CodeGenModule::EmitDeferred;
+   clang has no hook in it); and, as in C, one running optimization pass.
+   Measured in C++ (10,000 small functions; 250 std::map specializations
+   instantiated at the end of the file; one function of 20,000 statements;
+   -O0 and -O2; 96 cancels): medians of 2-17 ms while parsing, 14-18 ms
+   during template instantiation (1.7-1.9 s, up to 2.8 s, without the C++
+   checks), 36-100 ms during the IR generation at the end of the file (up
+   to 0.53 s), 71 ms in optimization (up to 0.22 s) and 26-37 ms in code
+   generation (up to 0.12 s).
    -E is not cancellable and runs to the end. A cancelled call reports
      error: compilation cancelled
    once, without a source location, and nothing after it (no "1 error
