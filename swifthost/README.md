@@ -155,6 +155,20 @@ libc++abi has no exception runtime, while clang turns C++ exceptions on by defau
 throwing part of libc++ (`std::map::at`, `std::function`, ...), links only when compiled with `-fno-exceptions`. The
 threads SDK from `-7` passes `-fno-exceptions` for C++ in its toolset, so SwiftPM builds need no manifest flag there.
 
+## Changes in swifthost-6.4.2-11
+
+- `swifthost_clang` accepts `-fmodule-map-file=` again (driver and cc1), which -10 rejected with the other module
+  options. SwiftPM 6.4.2 passes `-I <include> -fmodule-map-file=<map>` for every C target that a C or C++ target
+  depends on (for example cmark-gfm for cmark-gfm-extensions in swift-markdown), so such targets did not compile on -10.
+  With modules off clang only parses the map (and the maps its `extern module` declarations name); the objects are the
+  same as without it. A map's contents are trusted input, like headers: the checks on argument paths do not apply to the
+  paths in it. Everything that builds or imports a module stays rejected: `-fmodules`, `-fimplicit-module-maps`, every
+  other `-fmodule*` option, module pragmas and imports, PCHs. In C++20 and later, an `#include` that a loaded map covers
+  becomes a module import; stand-alone clang fails it too ("module ... is needed but has not been provided"), here it
+  fails like every module import: return value 1, one error line, no object (the `-MD` file is still written). C++
+  code that includes such a header inside `extern "C" { }` gets clang's `-Wmodule-import-in-extern-c` warning, as with
+  the stand-alone clang.
+
 ## Changes in swifthost-6.4.2-10
 
 - `swifthost_clang` compiles C++ too (see C and C++ targets): C++ and preprocessed C++ inputs, argv[0] `clang++` and

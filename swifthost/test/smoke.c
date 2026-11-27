@@ -85,6 +85,24 @@ static char *fmt(const char *f, ...) {
   return s;
 }
 
+/* 1 when both files exist and have the same bytes. */
+static int sameBytes(const char *a, const char *b) {
+  FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+  int same = fa && fb;
+  while (same) {
+    int ca = fgetc(fa), cb = fgetc(fb);
+    if (ca != cb)
+      same = 0;
+    else if (ca == EOF)
+      break;
+  }
+  if (fa)
+    fclose(fa);
+  if (fb)
+    fclose(fb);
+  return same;
+}
+
 static char *readFile(const char *path) {
   FILE *f = fopen(path, "rb");
   if (!f)
@@ -574,6 +592,60 @@ static void checkClang(void) {
   if (!b.rc) {
     char *out = runWasm("clang-swift-main");
     CHECK(!out || !strcmp(out, CLANG_EXPECT), "clang-swift-main output %s", out);
+  }
+
+  /* A target that depends on the C module, as SwiftPM compiles it: -I and
+     -fmodule-map-file= for the dependency. With modules off the map is only
+     parsed, so C and C++17 objects equal the ones built without it. In C++17
+     the header is still included as text, but clang, the stand-alone one too,
+     warns that the #include of a header from a module sits in extern "C"
+     (-Wmodule-import-in-extern-c). In C++20 the map turns the #include into a
+     module import, which fails (as in the stand-alone clang, which has no
+     module file to load). */
+  char *use = fmt("%s/cuse.c", dir), *useCxx = fmt("%s/cuse.cpp", dir);
+  writeFile(use, "#include \"cadd.h\"\nint cuse(int x) { return cadd(x, 1); }\n");
+  writeFile(useCxx, "extern \"C\" {\n#include \"cadd.h\"\n}\nint cuse(int x) { return cadd(x, 1); }\n");
+  char *mapArg = fmt("-fmodule-map-file=%s/module.modulemap", inc);
+  const struct {
+    const char *tag, *argv0, *src, *std;
+    int map, expectRc;
+  } dep[] = {
+      {"clang-dep", "clang", NULL, NULL, 0, 0},
+      {"clang-dep-modulemap", "clang", NULL, NULL, 1, 0},
+      {"clang-dep-cxx17", "clang++", "cxx", "-std=c++17", 0, 0},
+      {"clang-dep-cxx17-modulemap", "clang++", "cxx", "-std=c++17", 1, 0},
+      {"clang-dep-cxx20-modulemap", "clang++", "cxx", "-std=c++20", 1, 1},
+  };
+  for (size_t i = 0; i < sizeof dep / sizeof dep[0]; ++i) {
+    const char *extra[4] = {NULL};
+    int n = 0;
+    if (dep[i].std) {
+      extra[n++] = dep[i].std;
+      extra[n++] = "-fno-exceptions";
+    }
+    if (dep[i].map)
+      extra[n++] = mapArg;
+    char *depObj = fmt("%s/%s.o", dir, dep[i].tag);
+    rc = clangCompileAs(dep[i].argv0, extra, dep[i].src ? useCxx : use, depObj, inc, "-O2", dep[i].tag, &diag);
+    printf("%-24s rc %3d\n", dep[i].tag, rc);
+    if (dep[i].expectRc == 0) {
+      const char *externC = "warning: import of C++ module 'CAdd' appears within extern \"C\" language linkage "
+                            "specification [-Wmodule-import-in-extern-c]";
+      int warns = dep[i].src && dep[i].map;
+      CHECK(rc == 0 && diag && (warns ? strstr(diag, externC) && !strstr(diag, "error:") : !*diag),
+            "%s: rc %d, diagnostics: %s", dep[i].tag, rc, diag ? diag : "(null)");
+      if (dep[i].map)
+        CHECK(sameBytes(depObj, fmt("%s/%s.o", dir, dep[i - 1].tag)),
+              "%s: the object differs from the one built without -fmodule-map-file=", dep[i].tag);
+    } else {
+      int lines = 0;
+      for (const char *c = diag; c && *c; ++c)
+        lines += *c == '\n';
+      CHECK(rc == 1 && lines == 1 && strstr(diag, "error: swifthost_clang does not support module imports"),
+            "%s: rc %d (expected 1, a refused module import), diagnostics: %s", dep[i].tag, rc,
+            diag ? diag : "(null)");
+      CHECK(access(depObj, F_OK) != 0, "%s: the failed call wrote %s", dep[i].tag, depObj);
+    }
   }
 
   char *many = fmt("%s/many.c", dir), *manyObj = fmt("%s/many.o", dir);

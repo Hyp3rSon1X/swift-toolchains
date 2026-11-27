@@ -783,10 +783,11 @@ bool usesStandardStream(const llvm::opt::Arg &A) {
 // nvptx-arch to find the GPUs, and the SDK has no OpenMP runtime), that write
 // a compilation database (-MJ), that change the language (Objective-C;
 // --driver-mode= is checked with argv[0] in rejectedDriverCommand), clang
-// modules and C++20 modules (implicit module builds, module maps, module files
-// read or written: -fmodules, -fmodule-*, -fimplicit-module-maps,
-// -fprebuilt-module-path=, --precompile, ...), and configuration files, whose
-// options would bypass this check (-fopenmp-simd stays allowed). Also every
+// modules and C++20 modules (implicit module builds, module maps found by
+// search, module files read or written: -fmodules, -fmodule-*,
+// -fimplicit-module-maps, -fprebuilt-module-path=, --precompile, ...; but not
+// -fmodule-map-file=, see below), and configuration files, whose options
+// would bypass this check (-fopenmp-simd stays allowed). Also every
 // argument whose value names the process's standard input or output
 // (namesStandardStream). Returns the option as written, or an empty string.
 std::string rejectedDriverOption(const llvm::opt::Arg &A,
@@ -816,8 +817,13 @@ std::string rejectedDriverOption(const llvm::opt::Arg &A,
   // Option names (without their leading dashes) by prefix: -print-* and
   // --print-* print instead of compiling; then the offloading options (CUDA,
   // HIP, OpenMP, SYCL); then the module options ("fmodule" covers -fmodules,
-  // -fmodules-*, -fmodule-file=, -fmodule-output, -fmodule-map-file=,
-  // -fmodule-header and -fmodule-name=; "precompile" is --precompile).
+  // -fmodules-*, -fmodule-file=, -fmodule-output, -fmodule-header and
+  // -fmodule-name=; "precompile" is --precompile). -fmodule-map-file= is
+  // allowed (SwiftPM passes one for every C target a target depends on): with
+  // modules off clang only parses the map and the maps its extern module
+  // lines name, trusted input like headers (FrontendAction loads them into
+  // HeaderSearch); an #include a map turns into a module import (C++20 and
+  // later) reaches SwiftHostCompilerInstance::loadModule and is refused there.
   static const char *const rejectedPrefixes[] = {
       "print-",         "offload",           "no-offload",
       "foffload",       "cuda-",             "fcuda",
@@ -838,7 +844,9 @@ std::string rejectedDriverOption(const llvm::opt::Arg &A,
   // OpenMP's SIMD directives need neither the OpenMP runtime nor offloading.
   bool openMPSimd = option.matches(opts::OPT_fopenmp_simd) ||
                     option.matches(opts::OPT_fno_openmp_simd);
-  if (!openMPSimd && option.getKind() != llvm::opt::Option::InputClass &&
+  bool moduleMapFile = option.matches(opts::OPT_fmodule_map_file);
+  if (!openMPSimd && !moduleMapFile &&
+      option.getKind() != llvm::opt::Option::InputClass &&
       option.getKind() != llvm::opt::Option::UnknownClass)
     for (const char *prefix : rejectedPrefixes)
       if (option.getName().starts_with(prefix))
@@ -955,8 +963,9 @@ const char *rejectedFrontendOption(clang::CompilerInvocation &invocation) {
     return "-fno-temp-file";
   if (!frontend.CodeCompletionAt.FileName.empty())
     return "-code-completion-at=";
-  // Module files written or read, and module maps (which, with modules on,
-  // let #include build modules implicitly).
+  // Module files written or read, and module maps found by search (which,
+  // with modules on, let #include build modules implicitly). Module maps named
+  // by -fmodule-map-file= are only parsed (see rejectedDriverOption).
   const clang::HeaderSearchOptions &headerSearch =
       invocation.getHeaderSearchOpts();
   if (!frontend.ModuleOutputPath.empty())
@@ -965,8 +974,6 @@ const char *rejectedFrontendOption(clang::CompilerInvocation &invocation) {
       !headerSearch.PrebuiltModuleFiles.empty() ||
       !headerSearch.PrebuiltModulePaths.empty())
     return "-fmodule-file= (or -fprebuilt-module-path=)";
-  if (!frontend.ModuleMapFiles.empty())
-    return "-fmodule-map-file=";
   if (headerSearch.ImplicitModuleMaps)
     return "-fimplicit-module-maps";
   if (!headerSearch.ModuleCachePath.empty())

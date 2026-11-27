@@ -342,16 +342,22 @@ int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
    - Clang modules and C++20 modules, which build modules implicitly (on
      helper threads, into a module cache) or read or write module files, for
      C and C++ alike: -fmodules, -fcxx-modules, every -fmodule* and
-     -fmodules-* option (-fmodule-file=, -fmodule-output, -fmodule-output=,
-     -fmodule-map-file=, -fmodule-name=, -fmodule-header, -fmodule-header=,
-     -fmodules-cache-path=, -fmodules-reduced-bmi, ...),
+     -fmodules-* option except -fmodule-map-file= (-fmodule-file=,
+     -fmodule-output, -fmodule-output=, -fmodule-name=, -fmodule-header,
+     -fmodule-header=, -fmodules-cache-path=, -fmodules-reduced-bmi, ...),
      -fimplicit-module-maps, -fprebuilt-module-path=,
      -fprebuilt-implicit-modules, -fbuiltin-module-map, --precompile and
      -fexperimental-modules-reduced-bmi; at cc1 level -fmodules,
      -fcxx-modules, -fmodule-file=, -fprebuilt-module-path=,
-     -fmodule-output=, -fmodule-map-file=, -fimplicit-module-maps and
-     -fmodules-cache-path= (-fno-modules and -fno-implicit-modules are
-     fine).
+     -fmodule-output=, -fimplicit-module-maps and -fmodules-cache-path=
+     (-fno-modules and -fno-implicit-modules are fine). -fmodule-map-file=
+     (driver or cc1) is accepted, as SwiftPM passes it for C targets a target
+     depends on: with modules off clang only parses the map and the maps its
+     extern module declarations name. A map's contents are trusted input,
+     like sources and headers: the argument checks above do not apply to the
+     paths in a map, as they do not apply to #include paths. An #include that
+     a map turns into a module import (C++20 and later, where stand-alone
+     clang fails too without a module file) fails like every module import.
    - Precompiled headers: -include-pch, an -include whose .pch or .gch file
      exists next to the header (the driver turns it into -include-pch), and
      at cc1 level -include-pch and -chain-include.

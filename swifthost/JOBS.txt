@@ -225,7 +225,10 @@ SYCL), -ObjC, -ObjC++,
 SwiftHostCompiler.h; -Xclang passes other cc1 options through unchecked, so
 pass only cc1 options that you have tested. Module imports in the source
 (import, @import, #pragma clang module import) and #pragma clang module build
-fail with one error line too. With the same compiler sources
+fail with one error line too. -fmodule-map-file= is accepted (since -11;
+SwiftPM passes it for every C target that a target depends on): with modules
+off clang only parses the map, and in C++20 and later an #include that the
+map turns into a module import fails like every import. With the same compiler sources
 and flags the objects are byte-identical to the stand-alone clang's.
 
 Running the output
