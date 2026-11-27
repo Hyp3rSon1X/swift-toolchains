@@ -14,7 +14,70 @@
 # for (a test script in it does the same with its own), deletes its device and exits, so that a stopped run leaves
 # no process and no booted device behind. A run that is killed outright cannot do this, so sim_device_create first
 # deletes every device named <prefix>-<pid> whose process is gone.
-SIM_UDID= SIM_OWNED= PROC_PGID=
+#
+# Host-wide simulator lock: a fresh device's first boot starts about 200 daemons, and two at once (or one next to a
+# build) overload a shared Mac. sim_device_create takes a lock directory before `simctl create` and holds it until
+# the device is deleted: HYP3R_IOS_SIM_LOCK (default /Users/Shared/hyp3r-locks/ios-simulator.lock), used when its
+# parent directory exists. Its `owner` file names the holder (pid, its start time, project, job, since). A waiter
+# polls every 15 s for up to SWIFTHOST_SIM_LOCK_WAIT seconds (default 3600) and removes the lock only when it is
+# stale: its owner's pid is gone or now belongs to another process, or it has no owner file and is older than 60 s.
+SIM_UDID= SIM_OWNED= PROC_PGID= SIM_LOCK_HELD=
+SIM_LOCK=${HYP3R_IOS_SIM_LOCK:-/Users/Shared/hyp3r-locks/ios-simulator.lock}
+
+sim_trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+sim_lock_stale() { # <owner file content>
+  local pid pstart mtime
+  if [ -f "$SIM_LOCK/owner" ]; then
+    pid=$(printf '%s\n' "$1" | sed -n 's/^pid=//p')
+    pstart=$(printf '%s\n' "$1" | sed -n 's/^pstart=//p' | sim_trim)
+    [ -n "$pid" ] || return 1
+    ps -p "$pid" >/dev/null 2>&1 || return 0
+    [ "$(ps -o lstart= -p "$pid" | sim_trim)" != "$pstart" ]
+    return
+  fi
+  mtime=$(stat -f %m "$SIM_LOCK" 2>/dev/null) || return 1
+  [ $(($(date +%s) - mtime)) -gt 60 ]
+}
+
+sim_lock_acquire() {
+  [ -z "$SIM_LOCK_HELD" ] || return 0
+  [ -d "$(dirname "$SIM_LOCK")" ] || return 0
+  local start owner said=
+  start=$(date +%s)
+  until mkdir "$SIM_LOCK" 2>/dev/null; do
+    owner=$(cat "$SIM_LOCK/owner" 2>/dev/null || true)
+    if sim_lock_stale "$owner"; then
+      # Only if nobody replaced it in the meantime.
+      if [ "$(cat "$SIM_LOCK/owner" 2>/dev/null || true)" = "$owner" ]; then
+        echo "removing a stale simulator lock ($(printf '%s' "$owner" | tr '\n' ' '))" >&2
+        rm -f "$SIM_LOCK/owner"
+        rmdir "$SIM_LOCK" 2>/dev/null || true
+      fi
+      continue
+    fi
+    if [ -z "$said" ]; then
+      echo "waiting for the simulator lock $SIM_LOCK, held by: $(printf '%s' "$owner" | tr '\n' ' ')" >&2
+      said=1
+    fi
+    if [ $(($(date +%s) - start)) -ge "${SWIFTHOST_SIM_LOCK_WAIT:-3600}" ]; then
+      echo "the simulator lock is still held after ${SWIFTHOST_SIM_LOCK_WAIT:-3600} s" >&2
+      return 2
+    fi
+    sleep 15
+  done
+  printf 'pid=%s\npstart=%s\nproject=%s\njob=%s\nsince=%s\n' "$$" "$(ps -o lstart= -p "$$")" swifthost \
+    "${CI_JOB_ID:-local}" "$(date +%s)" > "$SIM_LOCK/owner"
+  SIM_LOCK_HELD=1
+}
+
+sim_lock_release() {
+  [ -n "$SIM_LOCK_HELD" ] || return 0
+  SIM_LOCK_HELD=
+  [ "$(sed -n 's/^pid=//p' "$SIM_LOCK/owner" 2>/dev/null)" = "$$" ] || return 0
+  rm -f "$SIM_LOCK/owner"
+  rmdir "$SIM_LOCK" 2>/dev/null || true
+}
 
 proc_run() {
   local rc=0
@@ -33,12 +96,13 @@ proc_stop() { # <signal>
 }
 
 sim_device_cleanup() {
-  [ -n "$SIM_UDID" ] || return 0
   local udid=$SIM_UDID owned=$SIM_OWNED
   SIM_UDID= SIM_OWNED=
-  [ -n "$owned" ] || return 0
-  xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
-  xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+  if [ -n "$udid" ] && [ -n "$owned" ]; then
+    xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true
+    xcrun simctl delete "$udid" >/dev/null 2>&1 || true
+  fi
+  sim_lock_release
 }
 
 sim_on_signal() { # <signal> <exit status>
@@ -77,6 +141,7 @@ sim_device_create() { # <prefix>
     echo "simulator device: the shared one, $SIM_UDID" >&2
     return 0
   fi
+  sim_lock_acquire || return 2
   sim_device_reap "$1"
   # Among the available iOS runtimes that support more than one iPhone (some support a single device, and simctl
   # create rejects others), the newest version, then the one that supports the most device types.
