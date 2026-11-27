@@ -281,7 +281,8 @@ int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
    std::vector::at, ...), compiles but does not link (__cxa_throw and
    __cxa_allocate_exception are undefined). Such targets need
    -fno-exceptions, with which libc++ aborts instead of throwing and a
-   "throw" in the target's own code is a compile error.
+   "throw" in the target's own code is a compile error. The threads SDK from
+   -7 passes -fno-exceptions for C++ in its toolset.
 
    Required: -target, a WebAssembly target (without it the call compiles for
    wasm32-unknown-wasip1, never for the host; other targets are rejected),

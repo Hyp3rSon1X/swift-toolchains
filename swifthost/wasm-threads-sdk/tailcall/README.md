@@ -161,6 +161,21 @@ different on every build; all others were already identical. The compiler now wr
 - The regression test is `test/AutoDiff/Serialization/differentiability_witness_determinism.swift` in the swift fork
   commit (`-emit-module -enable-deterministic-check`).
 
+## Changes in -7
+
+`swifthost-sdk-wasip1-threads-6.4.2-7` adds `-fno-exceptions` to `cxxCompiler.extraCLIOptions` in `toolset.json` (C++
+only; `cCompiler` and `swiftCompiler` are unchanged). The SDK's libc++abi has no exception runtime, while clang turns C++
+exceptions on by default, so ordinary C++ (`std::map::at`, `std::function`, ...) failed to link with
+`undefined symbol: __cxa_throw`. With the flag, libc++ aborts instead of throwing, and such code links.
+
+- `-7` was produced from the `-6` zip with `retoolset.sh` (the toolset step only, then the same deterministic zip step as
+  `package.sh`), not by a new build. Every other file of the bundle is byte-identical to `-6`.
+- Consequence: C++ code with its own `try` or `throw` no longer compiles, with clang's errors
+  `cannot use 'throw' with exceptions disabled` and `cannot use 'try' with exceptions disabled`. Such code has no
+  working exception runtime in this SDK anyway.
+- `package.sh` now writes the same toolset, so a fresh build of the recipe gives the `-7` bundle contents.
+- The reference package `../test/cxx-reference` needs no manifest flag with `-7`.
+
 ## Steps (macOS arm64, Xcode 27.2, cmake and ninja on PATH)
 
 ```

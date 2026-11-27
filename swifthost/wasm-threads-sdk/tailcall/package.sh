@@ -4,7 +4,8 @@
 # Changes to the generator output, nothing else:
 #  1. renamed swift-6.4.2-RELEASE_wasm-threads -> swift-6.4.2-RELEASE_wasm-threads-tailcall (bundle directory, artifact
 #     directory, info.json artifact key and variant path); the triple stays wasm32-unknown-wasip1-threads;
-#  2. toolset.json: -Xcc -mtail-call for swiftCompiler, -mtail-call for cCompiler and cxxCompiler;
+#  2. toolset.json: -Xcc -mtail-call for swiftCompiler, -mtail-call for cCompiler and cxxCompiler, and (from -7)
+#     -fno-exceptions for cxxCompiler only (the SDK's libc++abi has no exception runtime);
 #  3. the Embedded Swift variant removed (upstream 6.4.2 builds no Embedded stdlib for wasip1-threads).
 set -euo pipefail
 W=${W:?set W to the build directory}
@@ -38,6 +39,7 @@ t = load(toolset)
 t['swiftCompiler']['extraCLIOptions'] += ['-Xcc', '-mtail-call']
 t['cCompiler']['extraCLIOptions'] += ['-mtail-call']
 t['cxxCompiler']['extraCLIOptions'] += ['-mtail-call']
+t['cxxCompiler']['extraCLIOptions'] += ['-fno-exceptions']
 dump(toolset, t)
 PY
 rm -rf "$T/swift.xctoolchain/usr/lib/swift/embedded" "$T/swift.xctoolchain/usr/lib/swift_static/embedded" \

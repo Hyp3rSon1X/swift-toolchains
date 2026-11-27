@@ -152,7 +152,8 @@ C++ targets reach Swift through a C header (`extern "C"`), like C targets; Swift
 (`-cxx-interoperability-mode`) is not covered. The app must ship the SDK's `WASI.sdk/include/c++/v1` (libc++'s
 headers, found through `--sysroot`) and link `-lc++ -lc++abi`, which the Swift link line already does. The SDK's
 libc++abi has no exception runtime, while clang turns C++ exceptions on by default: a target that throws, or uses a
-throwing part of libc++ (`std::map::at`, `std::function`, ...), links only when compiled with `-fno-exceptions`.
+throwing part of libc++ (`std::map::at`, `std::function`, ...), links only when compiled with `-fno-exceptions`. The
+threads SDK from `-7` passes `-fno-exceptions` for C++ in its toolset, so SwiftPM builds need no manifest flag there.
 
 ## Changes in swifthost-6.4.2-10
 

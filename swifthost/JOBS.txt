@@ -190,9 +190,11 @@ has -lc++ -lc++abi. The SDK's libc++abi has no exception runtime, and C++
 exceptions are on by default: a target that throws or uses a throwing part of
 libc++ (std::map::at, std::function, ...) links only when compiled with
 -fno-exceptions (cxxSettings: [.unsafeFlags(["-fno-exceptions"])] in its
-manifest; a "throw" in its own code is then a compile error). Swift's C++
-interoperability (-cxx-interoperability-mode) is not covered: Swift calls a
-C++ target through a C header (extern "C"), as with a C target.
+manifest; a "throw" in its own code is then a compile error). The threads
+SDK from -7 passes -fno-exceptions for C++ in its toolset, so no manifest flag
+is needed there. Swift's C++ interoperability (-cxx-interoperability-mode) is
+not covered: Swift calls a C++ target through a C header (extern "C"), as with
+a C target.
 
 Debug builds may add -index-store-path <dir> (SwiftPM does). -target (a
 WebAssembly target), --sysroot and -resource-dir are required (without
