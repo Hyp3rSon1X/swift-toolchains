@@ -18,8 +18,10 @@
  *   (Writing to a pipe without a reader also raises SIGPIPE, which ends the
  *   process unless the app ignores SIGPIPE or set F_SETNOSIGPIPE on it.)
  *   Exception: frontend actions that print to standard output
- *   (-print-target-info, -help) write to the process's stdout.
- * - -Xllvm options go to LLVM's process-global option parser. -Xllvm -help,
+ *   (-print-target-info, -help) write to the process's stdout
+ *   (swifthost_clang rejects the options that would).
+ * - -Xllvm options (swifthost_clang: -mllvm) go to LLVM's process-global
+ *   option parser. -Xllvm -help,
  *   -Xllvm -version and an unknown or malformed -Xllvm option end the call
  *   through LLVM's exit path: the text goes to the process's stdout or
  *   stderr (not to out_fd/err_fd) and the call poisons the library (see
@@ -70,9 +72,14 @@
  * - The frontend needs -module-cache-path pointing at a writable directory
  *   (clang modules for the SDK's C headers are built there on first use, on a
  *   helper thread with an 8 MiB stack that the call waits for; all other work
- *   runs on the calling thread).
- * - A running frontend call can be cancelled from another thread with
- *   swifthost_request_cancel(); see there.
+ *   runs on the calling thread). swifthost_clang likewise moves deeply
+ *   recursive work (deeply nested source) to a helper thread with a fresh
+ *   8 MiB stack when about 8 MiB of the calling thread's stack are used.
+ *   clang ignores whether a crash there was recovered and carries on, so
+ *   such a call returns the compiler's status or, where that would be 0,
+ *   SWIFTHOST_EPOISONED; either way the library is poisoned.
+ * - A running frontend or clang call can be cancelled from another thread
+ *   with swifthost_request_cancel(); see there.
  * - Macros: the compiler sends macro expansion requests as JSON messages to an
  *   in-process plugin server, which is either a dynamic library that exports
  *   swift_inproc_plugins_handle_message (-in-process-plugin-server-path) or
@@ -90,7 +97,8 @@
  *   sourcekitd_initialize, which installs no handler of its own) and keeps
  *   installed: in a frontend or autolink
  *   call they are reported to its err_fd ("fatal error encountered during
- *   compilation"), in a wasm-ld call to its err_fd ("fatal error in the
+ *   compilation"), in a clang call to its err_fd ("fatal error in the C
+ *   compiler"), in a wasm-ld call to its err_fd ("fatal error in the
  *   linker"), on a compiler helper thread or any other thread to stderr
  *   ("LLVM ERROR: ...").
  *
@@ -203,8 +211,8 @@ extern "C" {
    0 or SWIFTHOST_ECANCELED. */
 #define SWIFTHOST_EPOISONED 125
 
-/* Returned by a frontend call that swifthost_request_cancel() stopped. Not an
-   error state: later calls work normally. */
+/* Returned by a frontend or clang call that swifthost_request_cancel()
+   stopped. Not an error state: later calls work normally. */
 #define SWIFTHOST_ECANCELED 124
 
 /* Returned by swifthost_sourcekitd_status() after an LLVM fatal error (or
@@ -224,6 +232,119 @@ const char *swifthost_version(void);
 int swifthost_swift_frontend(int argc, const char **argv, int out_fd,
                              int err_fd);
 
+/* Compiles one C source file with the library's clang, for the C targets of
+   packages. argv[0] = "clang" (its stem prefixes the driver's diagnostics;
+   names that select another driver mode, such as "clang++" or "clang-cl",
+   are rejected), then clang driver arguments for exactly one compile job,
+   for example:
+     clang -target wasm32-unknown-wasip1-threads --sysroot <SDK>/WASI.sdk
+           -resource-dir <SDK>/swift.xctoolchain/usr/lib/swift_static/clang
+           -O2 -c x.c -o x.o -MD -MF x.d
+   or argv[1] = "-cc1" followed by cc1 arguments (as -### prints them).
+   Response files (@file) are expanded first. Same contract as
+   swifthost_swift_frontend: serialized with the other calls, crash recovery
+   and poisoning, return value 0, 1 (an error, with diagnostics on err_fd),
+   SWIFTHOST_ECANCELED, SWIFTHOST_EPOISONED or 128 + signal; out_fd is unused.
+   An LLVM fatal error is reported on err_fd as "error: fatal error in the C
+   compiler: <reason>".
+
+   Inputs: C sources (.c, -x c) and preprocessed C (.i, -x cpp-output) only.
+   Every other input (LLVM IR, assembler, C++, Objective-C, headers and
+   precompiled headers, CUDA, HIP, files of unknown type, which the driver
+   would link, and "-" for standard input) is rejected before the driver
+   runs, and the job's input is checked again afterwards.
+
+   Required: -target, a WebAssembly target (without it the call compiles for
+   wasm32-unknown-wasip1, never for the host; other targets are rejected),
+   --sysroot (the SDK's WASI.sdk; without it the C library headers are not
+   found) and -resource-dir (clang's own headers; argv[0] is no real path in
+   the app, so clang cannot find them next to it, and a call without
+   -resource-dir is an error). The threads SDK
+   (wasm32-unknown-wasip1-threads) also needs its toolset's C flags:
+   -matomics -mbulk-memory -mthread-model posix -pthread
+   -ftls-model=local-exec (and -mtail-call for the tail-call bundle).
+
+   One call runs exactly one compile job: a command that needs more than one
+   (two source files with -c, or no -c, which adds a link job) fails with
+   "error: swifthost_clang runs exactly one compile job; this command needs N
+   jobs". The actions it runs: -c (object), -S, -emit-llvm (with -c or -S),
+   -fsyntax-only and -E (with -o). -### writes the version lines and the
+   job's command line to err_fd (quoted, as clang prints it) and runs
+   nothing. Debug builds may pass -index-store-path (as SwiftPM does). With
+   the same compiler sources and flags the objects are byte-identical to the
+   stand-alone clang's.
+
+   Rejected with one error line ("error: swifthost_clang does not support
+   <option>") and return value 1, before anything runs. These are the known
+   options that would break the contract; -Xclang passes any other cc1
+   option through unchecked, so pass only cc1 options that you have tested.
+   - Every driver or cc1 argument whose value names the process's standard
+     input or output or its terminal: "-", /dev/stdin, /dev/stdout,
+     /dev/stderr, /dev/tty, /dev/fd/N, paths that resolve into /dev (a
+     symbolic link to one of those) and existing devices, pipes and sockets,
+     except /dev/null, which stays allowed (-o -, -o /dev/stdout, -MF /dev/fd/1, -MJ -,
+     --serialize-diagnostics /dev/stderr, -foptimization-record-file=-, an
+     input "-" or /dev/stdin, ...), and -E without -o.
+   - Options that print to the process's stdout or stderr instead of err_fd:
+     -v, --version, -help, --help, --help-hidden, -print-* and --print-*
+     (including -print-targets, -print-resource-dir, -print-search-dirs,
+     -print-file-name=, -print-prog-name=, --print-supported-cpus),
+     --autocomplete=, -dumpmachine, -dumpversion, -ccc-print-phases,
+     -ccc-print-bindings, -H without a header include file, /showIncludes,
+     -ftime-report, and the cc1 options -print-stats, -help, -version,
+     -code-completion-at=, -fdump-record-layouts (and its -simple,
+     -canonical, -complete forms), -fdump-vtable-layouts and
+     -fdebug-pass-manager.
+   - Options that run more than the compile job (-save-temps,
+     -save-temps=), that load code (-fplugin=, -fpass-plugin=, -Xclang
+     -load, -plugin, -add-plugin, and their cc1 forms), and GPU offloading,
+     whose driver runs programs to find the GPUs (--offload-arch=,
+     --no-offload-arch=, --offload*, -foffload*, --cuda-*, -fcuda*, --hip-*,
+     -fhip*, --rocm-*, -fgpu-*, --gpu-*, -fopenmp, -fopenmp= and the other
+     -fopenmp* options except -fopenmp-simd and -fno-openmp-simd (the SDK
+     has no OpenMP runtime either), -fsycl*, -Xopenmp-target, -Xoffload-linker, -Xcuda-*,
+     -Xarch_device).
+   - Options that change the language or the driver (-ObjC, -ObjC++,
+     --driver-mode=), configuration files (--config, --config-system-dir=,
+     --config-user-dir=; default configuration files are never read) and
+     compilation databases (-MJ).
+   - -fno-temp-file (it writes the object in place, so a failed or cancelled
+     call would delete an older one), process-wide profiling (-ftime-trace),
+     the compilation cache (-fcache-compile-job) and the frontend actions
+     that wrap the compile (-fixit-recompile, -emit-symbol-graph,
+     -ast-merge). Other cc1 actions (-ast-dump, -emit-pch, ...) fail with an
+     error.
+   -mllvm options go to LLVM's process-global option parser as -Xllvm does
+   for the frontend (the next call resets them); an unknown one fails the
+   call with the parser's message on err_fd, but -mllvm -help and -mllvm
+   -version end it through LLVM's exit path (process stdout, poisoned).
+
+   Diagnostics go to err_fd: the driver's ("clang: error: ..."), the
+   compiler's ("file:line:column: error: ...", then "N errors generated."),
+   all without colors unless -fcolor-diagnostics or
+   -fdiagnostics-color=always is given. A failed call writes no object (an
+   older file at the -o path stays as it was); like the stand-alone clang it
+   still writes the -MD dependency file when the source was read.
+
+   Cancellation (swifthost_request_cancel()): the call checks at every
+   top-level declaration while it parses (the parse and semantic analysis of
+   one declaration and its LLVM IR generation run to the end, as does the IR
+   generation at the end of the file), before every optimization pass, in
+   code generation at its next function, pass or block, and once more when
+   the action ends. Measured (CPU time from the request to the return,
+   freeing included, two runs): medians of about 10-40 ms while parsing and
+   in code generation and 100-170 ms in optimization, up to about 0.5 s
+   when one optimization pass works on one function of 20,000 statements.
+   -E is not cancellable and runs to the end. A cancelled call reports
+     error: compilation cancelled
+   once, without a source location, and nothing after it (no "1 error
+   generated."), and returns SWIFTHOST_ECANCELED. It writes no object (an
+   older file at the -o path stays as it was), but the -MD dependency file is
+   written (rewritten if it exists), listing the files read before the cancel;
+   with -index-store-path the index store gets a unit for the object and
+   records for the headers read. Ignore every output of a cancelled call. */
+int swifthost_clang(int argc, const char **argv, int out_fd, int err_fd);
+
 /* argv[0] = "swift-autolink-extract", then the object files, -o <file>.
    Writes the linker flags the objects ask for (one per line) to <file>. */
 int swifthost_swift_autolink_extract(int argc, const char **argv, int out_fd,
@@ -232,8 +353,10 @@ int swifthost_swift_autolink_extract(int argc, const char **argv, int out_fd,
 /* argv[0] = "wasm-ld", then wasm-ld arguments. */
 int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
 
-/* Asks the swifthost_swift_frontend call that is running (on another thread)
-   to stop early. The call checks often: the type checker before its next
+/* Asks the swifthost_swift_frontend or swifthost_clang call that is running
+   (on another thread) to stop early. For swifthost_clang see there; the
+   rest of this comment is about frontend calls. The call checks often: the
+   type checker before its next
    statement, declaration, function body or constraint-solver step; SIL
    generation before its next statement or declaration; the SIL optimizer
    before its next pass and inside the passes and analyses that take long on
@@ -259,7 +382,7 @@ int swifthost_wasm_ld(int argc, const char **argv, int out_fd, int err_fd);
      <unknown>:0: error: compilation cancelled
    Nothing is reported after it; diagnostics reported before the cancel (about
    the code) stay. Ignore every output of a cancelled call. Does nothing when
-   no frontend call is running (a call still waiting for its turn is not
+   no frontend or clang call is running (a call still waiting for its turn is not
    affected), and never affects a later call. Callable from any thread; returns
    immediately. Autolink and wasm-ld calls are not cancellable (they are short
    and bounded by their input). */

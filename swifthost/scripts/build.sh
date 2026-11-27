@@ -235,7 +235,7 @@ cmd_slice() {
     [[ $SOURCEKIT != 1 ]] ||
       ninja -t commands lib/libsourcekitdInProc.dylib | tail -1 | tr ' ' '\n' | grep -E '\.(a|o)$'
   } | awk '!s[$0]++')
-  printf '%s\n' _swifthost_version _swifthost_swift_frontend _swifthost_swift_autolink_extract _swifthost_wasm_ld \
+  printf '%s\n' _swifthost_version _swifthost_swift_frontend _swifthost_clang _swifthost_swift_autolink_extract _swifthost_wasm_ld \
     _swifthost_request_cancel _swifthost_set_plugin_message_handler _swifthost_sourcekitd_status > "$O/exports.txt"
   # sourcekitd's C API (the portable list; the -darwin one adds C++ symbols
   # for the XPC service). -u pulls in the archive members that define them.

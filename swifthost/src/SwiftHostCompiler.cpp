@@ -1,5 +1,6 @@
-// SwiftHostCompiler: C entry points that run swift-frontend,
-// swift-autolink-extract and wasm-ld in-process and, in a build with SourceKit
+// SwiftHostCompiler: C entry points that run swift-frontend, clang (one C
+// compile job per call), swift-autolink-extract and wasm-ld in-process and, in
+// a build with SourceKit
 // (SWIFTHOST_SOURCEKIT), the policy that lets the in-process sourcekitd share
 // the process with them. See SwiftHostCompiler.h for the contract.
 #include "SwiftHostCompiler.h"
@@ -12,12 +13,43 @@
 #include "swift/Basic/Version.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/FrontendTool/FrontendTool.h"
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
+#include "clang/Basic/Stack.h"
+#include "clang/CodeGen/CodeGenAction.h"
+#include "clang/CodeGen/ObjectFilePCHContainerWriter.h"
+#include "clang/Driver/Compilation.h"
+#include "clang/Driver/Driver.h"
+#include "clang/Driver/Job.h"
+#include "clang/Driver/Options.h"
+#include "clang/Driver/Tool.h"
+#include "clang/Driver/ToolChain.h"
+#include "clang/Frontend/CompilerInstance.h"
+#include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Frontend/FrontendActions.h"
+#include "clang/Frontend/MultiplexConsumer.h"
+#include "clang/Frontend/TextDiagnosticBuffer.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Index/IndexingAction.h"
+#include "clang/Rewrite/Frontend/FrontendActions.h"
+#include "clang/Serialization/ObjectFilePCHContainerReader.h"
 #include "lld/Common/Driver.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/IR/CompilationCancellation.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/PassInstrumentation.h"
+#include "llvm/Option/ArgList.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/CrashRecoveryContext.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/StringSaver.h"
+#include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
 #if SWIFTHOST_SOURCEKIT
@@ -110,9 +142,15 @@ void endSourceKitRecovery() {
 #endif
 
 // What the calling thread is doing, for the fatal error router: a frontend
-// or autolink call (Compiler) or a wasm-ld call (Linker), with the call's
-// err_fd, or sourcekitd's work (SourceKit).
-enum class ThreadRole : unsigned char { None, Compiler, Linker, SourceKit };
+// or autolink call (Compiler), a clang call (CCompiler) or a wasm-ld call
+// (Linker), with the call's err_fd, or sourcekitd's work (SourceKit).
+enum class ThreadRole : unsigned char {
+  None,
+  Compiler,
+  CCompiler,
+  Linker,
+  SourceKit
+};
 thread_local ThreadRole tRole = ThreadRole::None;
 thread_local int tErrFd = -1;
 // The reason of a fatal error in sourcekitd's work on this thread.
@@ -135,8 +173,8 @@ private:
   int savedErrFd;
 };
 
-// Cancellation: each frontend call gets a fresh flag, published here while it
-// runs, so a request can never leak into a later call.
+// Cancellation: each frontend or clang call gets a fresh flag, published here
+// while it runs, so a request can never leak into a later call.
 std::mutex gCancelLock;
 std::shared_ptr<std::atomic<bool>> gCancelFlag;
 
@@ -277,7 +315,7 @@ void writeText(int fd, const char *text) { writeAll(fd, text, std::strlen(text))
 // installed by the library for good: the frontend calls do not install their
 // own (CancellationObserver), nor does sourcekitd_initialize
 // (shouldInstallFatalErrorHandler). It reports each fatal error where the thread's work belongs:
-// a frontend or linker call's err_fd, or sourcekitd's crash containment.
+// a frontend, clang or linker call's err_fd, or sourcekitd's crash containment.
 void routeFatalError(void *, const char *reason, bool) {
   switch (tRole) {
   case ThreadRole::Compiler:
@@ -287,6 +325,11 @@ void routeFatalError(void *, const char *reason, bool) {
     writeText(tErrFd, "<unknown>:0: error: fatal error encountered during "
                       "compilation; " SWIFT_BUG_REPORT_MESSAGE "\n"
                       "<unknown>:0: note: ");
+    writeText(tErrFd, reason);
+    writeText(tErrFd, "\n");
+    return;
+  case ThreadRole::CCompiler:
+    writeText(tErrFd, "error: fatal error in the C compiler: ");
     writeText(tErrFd, reason);
     writeText(tErrFd, "\n");
     return;
@@ -647,6 +690,674 @@ template <typename Fn> int runRecovering(Fn fn, bool &poison) {
   return rc;
 }
 
+// In-process clang (swifthost_clang): clang's driver, used only to turn a
+// command line into its compile job, and that job run in-process the way
+// clang's cc1_main and ExecuteCompilerInvocation run it, without their
+// process-level parts (fatal error handler, stack rlimit, timers, the
+// compilation cache, deliberately leaked memory).
+
+// The target of a command line without -target: never the host.
+constexpr char kClangDefaultTriple[] = "wasm32-unknown-wasip1";
+
+void writeClangError(llvm::raw_ostream &os, const llvm::Twine &message) {
+  os << "error: " << message << "\n";
+  os.flush();
+}
+
+// The inputs swifthost_clang compiles: C sources and preprocessed C, as the
+// driver classifies them and as cc1 sees them. The one place to widen (for
+// example to C++) once another language is tested.
+bool isSupportedDriverInput(clang::driver::types::ID type) {
+  return type == clang::driver::types::TY_C ||
+         type == clang::driver::types::TY_PP_C;
+}
+
+bool isSupportedFrontendInput(const clang::InputKind &kind) {
+  return kind.getLanguage() == clang::Language::C &&
+         kind.getFormat() == clang::InputKind::Source && !kind.isHeader() &&
+         !kind.isHeaderUnit();
+}
+
+// Whether a path names one of the process's standard streams or its
+// terminal: "-", the device paths /dev/stdin, /dev/stdout, /dev/stderr,
+// /dev/tty and /dev/fd/N (also with "." and ".." in them), a path that
+// resolves into /dev (a symbolic link to one of those), or an existing
+// device, pipe or socket (what the streams usually are). /dev/null stays
+// allowed.
+bool namesStandardStream(llvm::StringRef value) {
+  if (value == "-")
+    return true;
+  llvm::SmallString<128> path(value);
+  if (llvm::sys::path::is_absolute(path))
+    llvm::sys::path::remove_dots(path, /*remove_dot_dot=*/true);
+  llvm::StringRef normalized = path.str();
+  if (normalized == "/dev/stdin" || normalized == "/dev/stdout" ||
+      normalized == "/dev/stderr" || normalized == "/dev/tty" ||
+      normalized.starts_with("/dev/fd/"))
+    return true;
+  llvm::SmallString<128> real;
+  if (!llvm::sys::fs::real_path(value, real) &&
+      llvm::StringRef(real).starts_with("/dev/") && real != "/dev/null")
+    return true;
+  llvm::sys::fs::file_status status, null;
+  if (llvm::sys::fs::status(value, status))
+    return false;
+  switch (status.type()) {
+  case llvm::sys::fs::file_type::character_file:
+    return llvm::sys::fs::status("/dev/null", null) ||
+           status.getUniqueID() != null.getUniqueID();
+  case llvm::sys::fs::file_type::block_file:
+  case llvm::sys::fs::file_type::fifo_file:
+  case llvm::sys::fs::file_type::socket_file:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Whether an argument's value names the process's standard input or output.
+bool usesStandardStream(const llvm::opt::Arg &A) {
+  for (const char *value : A.getValues())
+    if (value && namesStandardStream(value))
+      return true;
+  return false;
+}
+
+// The driver option, if A is one swifthost_clang rejects: options that make
+// the driver print to the process's stdout or stderr (everything
+// Driver::HandleImmediateArgs handles except -###, and -ccc-print-*), that
+// need more than the one compile job (-save-temps), that load code into the
+// process (plugins), that offload to GPUs (the driver runs amdgpu-arch or
+// nvptx-arch to find the GPUs, and the SDK has no OpenMP runtime), that write
+// a compilation database (-MJ), that change the language or the driver mode
+// (only C is supported), and configuration files, whose options would bypass
+// this check (-fopenmp-simd stays allowed). Also every argument whose value
+// names the process's standard input or output (namesStandardStream).
+// Returns the option as written, or an empty string.
+std::string rejectedDriverOption(const llvm::opt::Arg &A,
+                                 const llvm::opt::ArgList &args) {
+  namespace opts = clang::driver::options;
+  static const unsigned rejected[] = {
+      opts::OPT_v,
+      opts::OPT__version,
+      opts::OPT_help,
+      opts::OPT__help_hidden,
+      opts::OPT_dumpmachine,
+      opts::OPT_dumpversion,
+      opts::OPT_autocomplete,
+      opts::OPT_ccc_print_phases,
+      opts::OPT_ccc_print_bindings,
+      opts::OPT_save_temps,
+      opts::OPT_save_temps_EQ,
+      opts::OPT_fplugin_EQ,
+      opts::OPT_fpass_plugin_EQ,
+      opts::OPT_config,
+      opts::OPT_config_system_dir_EQ,
+      opts::OPT_config_user_dir_EQ,
+      opts::OPT_MJ,
+      opts::OPT_driver_mode,
+      opts::OPT_ObjC,
+      opts::OPT_ObjCXX,
+  };
+  // Option names (without their leading dashes) by prefix: -print-* and
+  // --print-* print instead of compiling; the rest are the offloading
+  // options (CUDA, HIP, OpenMP, SYCL).
+  static const char *const rejectedPrefixes[] = {
+      "print-",   "offload",        "no-offload", "foffload",
+      "cuda-",    "fcuda",          "hip-",       "fhip",
+      "rocm-",    "fgpu-",          "gpu-",       "fopenmp",
+      "fsycl",    "Xopenmp-target", "Xoffload",   "Xcuda",
+      "Xarch_device",
+  };
+  const llvm::opt::Option &option = A.getOption();
+  if (usesStandardStream(A))
+    return A.getAsString(args);
+  for (unsigned id : rejected)
+    if (option.matches(id))
+      return A.getAsString(args);
+  // OpenMP's SIMD directives need neither the OpenMP runtime nor offloading.
+  bool openMPSimd = option.matches(opts::OPT_fopenmp_simd) ||
+                    option.matches(opts::OPT_fno_openmp_simd);
+  if (!openMPSimd && option.getKind() != llvm::opt::Option::InputClass &&
+      option.getKind() != llvm::opt::Option::UnknownClass)
+    for (const char *prefix : rejectedPrefixes)
+      if (option.getName().starts_with(prefix))
+        return A.getAsString(args);
+  // The cc1 options that load plugins, passed through -Xclang.
+  if (option.matches(opts::OPT_Xclang)) {
+    llvm::StringRef value = A.getValue();
+    if (value.starts_with("-load") || value.starts_with("-plugin") ||
+        value.starts_with("-add-plugin") || value.starts_with("-fplugin") ||
+        value.starts_with("-fpass-plugin"))
+      return A.getAsString(args);
+  }
+  return std::string();
+}
+
+// What makes a driver command line unsupported before the driver runs: a
+// driver mode other than the default one (argv[0] "clang++", "clang-cl",
+// ...), a target other than WebAssembly (the GPU toolchains run programs to
+// find the GPUs, and the library only has the WebAssembly backend), and
+// inputs that are not C (by -x or by their extension; an unknown extension
+// is a linker input). Returns the message, or an empty string.
+std::string rejectedDriverCommand(llvm::ArrayRef<const char *> argv,
+                                  const llvm::opt::InputArgList &args) {
+  namespace opts = clang::driver::options;
+  namespace types = clang::driver::types;
+  clang::driver::ParsedClangName name =
+      clang::driver::ToolChain::getTargetAndModeFromProgramName(argv[0]);
+  if (name.DriverMode)
+    return std::string("swifthost_clang does not support the driver mode of "
+                       "argv[0] \"") +
+           argv[0] + "\" (use \"clang\")";
+  std::string triple = kClangDefaultTriple;
+  if (name.TargetIsValid)
+    triple = name.TargetPrefix;
+  if (const llvm::opt::Arg *target = args.getLastArg(opts::OPT_target))
+    triple = target->getValue();
+  if (!llvm::Triple(triple).isWasm())
+    return "swifthost_clang compiles only for WebAssembly, not for " + triple;
+  types::ID language = types::TY_INVALID;
+  for (const llvm::opt::Arg *A : args) {
+    if (A->getOption().matches(opts::OPT_x)) {
+      llvm::StringRef value = A->getValue();
+      language = value == "none" ? types::TY_INVALID
+                                 : types::lookupTypeForTypeSpecifier(A->getValue());
+      if (value != "none" && !isSupportedDriverInput(language))
+        return "swifthost_clang does not support -x " + value.str() +
+               " (only C: -x c, -x cpp-output)";
+      continue;
+    }
+    if (A->getOption().getKind() != llvm::opt::Option::InputClass)
+      continue;
+    llvm::StringRef input = A->getValue();
+    types::ID type = language;
+    if (type == types::TY_INVALID) {
+      llvm::StringRef extension = llvm::sys::path::extension(input);
+      type = extension.empty() ? types::TY_INVALID
+                               : types::lookupTypeForExtension(extension.drop_front());
+    }
+    if (!isSupportedDriverInput(type))
+      return "swifthost_clang does not support the input " + input.str() +
+             " (only C sources (.c) and preprocessed C (.i))";
+  }
+  return std::string();
+}
+
+// The frontend option, if the invocation uses one that swifthost_clang
+// rejects: options that print to the process's stdout or stderr, that load
+// code, that use process-wide state clang cannot share (the time trace
+// profiler, timers, the compilation cache), that would delete an older output
+// of a failed or cancelled call (-fno-temp-file writes the output in place),
+// and the actions that wrap the compile in further work. The cc1 command
+// lines of the driver mode pass through here too. These are the known ones;
+// other cc1 options given through -Xclang pass unchecked.
+const char *rejectedFrontendOption(clang::CompilerInvocation &invocation) {
+  const clang::FrontendOptions &frontend = invocation.getFrontendOpts();
+  const clang::DependencyOutputOptions &dependencies =
+      invocation.getDependencyOutputOpts();
+  if (frontend.ShowHelp)
+    return "-help";
+  if (frontend.ShowVersion)
+    return "-version";
+  if (!frontend.Plugins.empty())
+    return "-load";
+  if (!frontend.AddPluginActions.empty() ||
+      frontend.ProgramAction == clang::frontend::PluginAction)
+    return "-plugin/-add-plugin";
+  if (!invocation.getCodeGenOpts().PassPlugins.empty())
+    return "-fpass-plugin=";
+  if (frontend.PrintSupportedCPUs)
+    return "--print-supported-cpus";
+  if (frontend.PrintSupportedExtensions)
+    return "--print-supported-extensions";
+  if (frontend.PrintEnabledExtensions)
+    return "--print-enabled-extensions";
+  if (frontend.ShowStats)
+    return "-print-stats";
+  if (invocation.getHeaderSearchOpts().Verbose)
+    return "-v";
+  if (!frontend.TimeTracePath.empty())
+    return "-ftime-trace";
+  if (invocation.getCodeGenOpts().TimePasses)
+    return "-ftime-report";
+  if (frontend.CacheCompileJob)
+    return "-fcache-compile-job";
+  if (!frontend.UseTemporary)
+    return "-fno-temp-file";
+  if (!frontend.CodeCompletionAt.FileName.empty())
+    return "-code-completion-at=";
+  const clang::LangOptions &lang = invocation.getLangOpts();
+  if (lang.DumpRecordLayouts || lang.DumpRecordLayoutsSimple ||
+      lang.DumpRecordLayoutsCanonical || lang.DumpRecordLayoutsComplete)
+    return "-fdump-record-layouts";
+  if (lang.DumpVTableLayouts)
+    return "-fdump-vtable-layouts";
+  if (invocation.getCodeGenOpts().DebugPassManager)
+    return "-fdebug-pass-manager";
+  if (frontend.FixAndRecompile)
+    return "-fixit-recompile";
+  if (frontend.EmitSymbolGraph)
+    return "-emit-symbol-graph";
+  if (!frontend.ASTMergeFiles.empty())
+    return "-ast-merge";
+  if (dependencies.ShowHeaderIncludes &&
+      (dependencies.HeaderIncludeOutputFile.empty() ||
+       dependencies.HeaderIncludeOutputFile == "-"))
+    return "-H (without a header include output file)";
+  if (dependencies.ShowIncludesDest != clang::ShowIncludesDestination::None)
+    return "/showIncludes";
+  if (dependencies.OutputFile == "-")
+    return "-MF - (dependencies to standard output)";
+  // -E without -o reaches cc1 as -o -.
+  if (frontend.OutputFile == "-" ||
+      (frontend.OutputFile.empty() &&
+       frontend.ProgramAction == clang::frontend::PrintPreprocessedInput))
+    return "-o - (output to standard output)";
+  return nullptr;
+}
+
+// The action of an invocation, for the actions swifthost_clang runs; null for
+// any other. Code generation uses the call's context.
+std::unique_ptr<clang::FrontendAction>
+createClangAction(clang::CompilerInstance &instance,
+                  llvm::LLVMContext *context) {
+  namespace fe = clang::frontend;
+  switch (instance.getFrontendOpts().ProgramAction) {
+  case fe::EmitObj:
+    return std::make_unique<clang::EmitObjAction>(context);
+  case fe::EmitAssembly:
+    return std::make_unique<clang::EmitAssemblyAction>(context);
+  case fe::EmitBC:
+    return std::make_unique<clang::EmitBCAction>(context);
+  case fe::EmitLLVM:
+    return std::make_unique<clang::EmitLLVMAction>(context);
+  case fe::EmitLLVMOnly:
+    return std::make_unique<clang::EmitLLVMOnlyAction>(context);
+  case fe::ParseSyntaxOnly:
+    return std::make_unique<clang::SyntaxOnlyAction>();
+  case fe::PrintPreprocessedInput:
+    if (instance.getPreprocessorOutputOpts().RewriteIncludes ||
+        instance.getPreprocessorOutputOpts().RewriteImports)
+      return std::make_unique<clang::RewriteIncludesAction>();
+    return std::make_unique<clang::PrintPreprocessedAction>();
+  default:
+    return nullptr;
+  }
+}
+
+// The cancellation of one clang call: its flag, checked at the three layers
+// (parse/Sema, LLVM optimization, LLVM code generation), and the error that
+// reports it, once and without a source location. The error makes clang
+// discard the call's output files when the action ends (EndSourceFile).
+class ClangCancellation {
+public:
+  ClangCancellation(const std::atomic<bool> &flag,
+                    clang::CompilerInstance &instance)
+      : flag(flag), instance(instance),
+        diagID(instance.getDiagnostics().getCustomDiagID(
+            clang::DiagnosticsEngine::Error, "compilation cancelled")) {}
+
+  // Whether the call is cancelled; reports it the first time.
+  bool check() {
+    if (reported)
+      return true;
+    if (!flag.load(std::memory_order_relaxed))
+      return false;
+    reported = true;
+    clang::DiagnosticsEngine &diags = instance.getDiagnostics();
+    diags.Report(diagID);
+    // Nothing is reported after it: neither what a stopped code generator or
+    // the end of the file might still diagnose, nor the "1 error generated."
+    // count, which clang writes to the verbose output stream at the end.
+    diags.setSuppressAllDiagnostics(true);
+    instance.setVerboseOutputStream(llvm::nulls());
+    return true;
+  }
+
+private:
+  const std::atomic<bool> &flag;
+  clang::CompilerInstance &instance;
+  unsigned diagID;
+  bool reported = false;
+};
+
+// Forwards everything to the action's own consumer, and stops the parser
+// (ParseAST ends when HandleTopLevelDecl returns false) and the work at the
+// end of the translation unit (code generation) once the call is cancelled.
+class CancellingConsumer : public clang::MultiplexConsumer {
+public:
+  CancellingConsumer(std::unique_ptr<clang::ASTConsumer> consumer,
+                     ClangCancellation &cancellation)
+      : MultiplexConsumer(std::move(consumer)), cancellation(cancellation) {}
+
+  bool HandleTopLevelDecl(clang::DeclGroupRef group) override {
+    if (cancellation.check())
+      return false;
+    bool more = MultiplexConsumer::HandleTopLevelDecl(group);
+    return more && !cancellation.check();
+  }
+
+  void HandleTranslationUnit(clang::ASTContext &context) override {
+    if (cancellation.check())
+      return;
+    MultiplexConsumer::HandleTranslationUnit(context);
+    // A cancel during optimization or code generation stops them part-way
+    // (the pass instrumentation and the context's flag); their output must
+    // not be kept.
+    cancellation.check();
+  }
+
+private:
+  ClangCancellation &cancellation;
+};
+
+// Wraps an AST action so that its consumer is a CancellingConsumer.
+class CancellableAction : public clang::WrapperFrontendAction {
+public:
+  CancellableAction(std::unique_ptr<clang::FrontendAction> action,
+                    ClangCancellation &cancellation)
+      : WrapperFrontendAction(std::move(action)), cancellation(cancellation) {}
+
+protected:
+  // Whatever the action did, a call that is cancelled by its end reports it
+  // before EndSourceFile, so that its outputs are discarded (an action that
+  // builds no AST, or work after the end of the translation unit).
+  void ExecuteAction() override {
+    WrapperFrontendAction::ExecuteAction();
+    cancellation.check();
+  }
+
+  std::unique_ptr<clang::ASTConsumer>
+  CreateASTConsumer(clang::CompilerInstance &instance,
+                    llvm::StringRef inFile) override {
+    std::unique_ptr<clang::ASTConsumer> consumer =
+        WrapperFrontendAction::CreateASTConsumer(instance, inFile);
+    if (!consumer)
+      return nullptr;
+    return std::make_unique<CancellingConsumer>(std::move(consumer),
+                                                cancellation);
+  }
+
+private:
+  ClangCancellation &cancellation;
+};
+
+// Runs one cc1 command line (args[0] is "-cc1") as cc1_main does. Under gLock.
+int runClangFrontend(llvm::ArrayRef<const char *> args, const char *argv0,
+                     llvm::raw_ostream &errOS, const std::atomic<bool> &flag) {
+  // Clang modules and PCHs wrapped in object files, as cc1_main registers.
+  auto pchOps = std::make_shared<clang::PCHContainerOperations>();
+  pchOps->registerWriter(std::make_unique<clang::ObjectFilePCHContainerWriter>());
+  pchOps->registerReader(std::make_unique<clang::ObjectFilePCHContainerReader>());
+
+  // The diagnostics of argument parsing are buffered until the diagnostics
+  // engine that the parsed options describe exists.
+  clang::DiagnosticOptions bufferOptions;
+  auto *buffer = new clang::TextDiagnosticBuffer;
+  clang::DiagnosticsEngine bufferDiags(clang::DiagnosticIDs::create(),
+                                       bufferOptions, buffer);
+  auto invocation = std::make_shared<clang::CompilerInvocation>();
+  bool parsed = clang::CompilerInvocation::CreateFromArgs(*invocation, args,
+                                                          bufferDiags, argv0);
+
+  // The call's LLVM context, with the call's flag attached for the legacy pass
+  // manager (code generation). It outlives the compiler instance and the
+  // action, which hold its module.
+  llvm::LLVMContext context;
+  llvm::CancellationScope codeGenCancellation(context, &flag);
+
+  auto instance = std::make_unique<clang::CompilerInstance>(
+      std::move(invocation), std::move(pchOps));
+  // A file system of the call's own: one from getRealFileSystem() would
+  // change the process's working directory for -working-directory.
+  instance->createVirtualFileSystem(llvm::vfs::createPhysicalFileSystem(),
+                                    buffer);
+  instance->createDiagnostics(
+      new clang::TextDiagnosticPrinter(errOS, instance->getDiagnosticOpts()),
+      /*ShouldOwnClient=*/true);
+  if (!instance->hasDiagnostics())
+    return 1;
+  // "N errors generated." and the like.
+  instance->setVerboseOutputStream(errOS);
+  buffer->FlushDiagnostics(instance->getDiagnostics());
+  auto finishDiagnostics = llvm::make_scope_exit(
+      [&] { instance->getDiagnosticClient().finish(); });
+  if (!parsed)
+    return 1;
+
+  // Standard input or output in any cc1 argument (the parsed options only
+  // show some of them).
+  {
+    unsigned missingIndex = 0, missingCount = 0;
+    llvm::opt::InputArgList cc1Args = clang::driver::getDriverOptTable().ParseArgs(
+        args.slice(1), missingIndex, missingCount,
+        llvm::opt::Visibility(clang::driver::options::CC1Option));
+    for (const llvm::opt::Arg *A : cc1Args)
+      if (usesStandardStream(*A)) {
+        writeClangError(errOS, "swifthost_clang does not support " +
+                                   A->getAsString(cc1Args));
+        return 1;
+      }
+  }
+  if (const char *option = rejectedFrontendOption(instance->getInvocation())) {
+    writeClangError(errOS, llvm::Twine("swifthost_clang does not support ") +
+                               option);
+    return 1;
+  }
+  for (const clang::FrontendInputFile &input : instance->getFrontendOpts().Inputs)
+    if (!isSupportedFrontendInput(input.getKind())) {
+      writeClangError(errOS, "swifthost_clang does not support the input " +
+                                 input.getFile() +
+                                 " (only C sources and preprocessed C)");
+      return 1;
+    }
+  clang::FrontendOptions &frontendOpts = instance->getFrontendOpts();
+  // The driver passes -disable-free; in a long-lived process the AST, the
+  // module and everything else must be freed when the call ends.
+  frontendOpts.DisableFree = false;
+  instance->getCodeGenOpts().DisableFree = false;
+  frontendOpts.MayEmitDiagnosticsAfterProcessingSourceFiles = true;
+  if (instance->getHeaderSearchOpts().UseBuiltinIncludes &&
+      instance->getHeaderSearchOpts().ResourceDir.empty()) {
+    writeClangError(errOS, "swifthost_clang needs -resource-dir (the SDK's "
+                           "swift.xctoolchain/usr/lib/swift_static/clang)");
+    return 1;
+  }
+
+  // -mllvm, as ExecuteCompilerInvocation applies it (with its bounds-safety
+  // default). LLVM's options are process-wide: the next call resets them.
+  // Parse errors go to err_fd and fail the call; -mllvm -help or -version
+  // still end it through LLVM's exit path (which poisons the library).
+  std::vector<std::string> &llvmArgs = frontendOpts.LLVMArgs;
+  if (instance->getLangOpts().BoundsSafety &&
+      std::none_of(llvmArgs.begin(), llvmArgs.end(), [](const std::string &a) {
+        return llvm::StringRef(a).starts_with("-enable-constraint-elimination");
+      }))
+    llvmArgs.push_back("-enable-constraint-elimination");
+  if (!llvmArgs.empty()) {
+    gLLVMOptionsSet = true;
+    std::vector<const char *> llvmArgv;
+    llvmArgv.push_back("clang (LLVM option parsing)");
+    for (const std::string &a : llvmArgs)
+      llvmArgv.push_back(a.c_str());
+    llvmArgv.push_back(nullptr);
+    if (!llvm::cl::ParseCommandLineOptions(
+            (int)llvmArgv.size() - 1, llvmArgv.data(), /*Overview=*/"", &errOS,
+            &instance->getVirtualFileSystem()))
+      return 1;
+  }
+
+  std::unique_ptr<clang::FrontendAction> action =
+      createClangAction(*instance, &context);
+  if (!action) {
+    writeClangError(errOS, "swifthost_clang runs only compile jobs that write "
+                           "an object, assembly, LLVM IR or bitcode, "
+                           "preprocess (-E) or check syntax (-fsyntax-only)");
+    return 1;
+  }
+  bool preprocessOnly = action->usesPreprocessorOnly();
+  // SwiftPM passes -index-store-path in debug builds.
+  if (!frontendOpts.IndexStorePath.empty()) {
+    instance->getCodeGenOpts().ClearASTBeforeBackend = false;
+    action = clang::index::createIndexDataRecordingAction(frontendOpts,
+                                                          std::move(action));
+    instance->setGenModuleActionWrapper(
+        &clang::index::createIndexDataRecordingAction);
+  }
+
+  ClangCancellation cancellation(flag, *instance);
+  // Parse/Sema: checked at each top-level declaration. -E has no AST and
+  // runs to the end.
+  if (!preprocessOnly)
+    action = std::make_unique<CancellableAction>(std::move(action),
+                                                 cancellation);
+  // LLVM optimization (new pass manager): no further optional pass once the
+  // call is cancelled.
+  const std::atomic<bool> *flagPtr = &flag;
+  instance->getCodeGenOpts().PassBuilderCallbacks.push_back(
+      [flagPtr](llvm::PassBuilder &builder) {
+        if (llvm::PassInstrumentationCallbacks *callbacks =
+                builder.getPassInstrumentationCallbacks())
+          callbacks->registerShouldRunOptionalPassCallback(
+              [flagPtr](llvm::StringRef, llvm::Any) {
+                return !flagPtr->load(std::memory_order_relaxed);
+              });
+      });
+
+  // Clang moves deeply recursive work to a thread with a fresh 8 MiB stack
+  // when this one runs low; the measure starts here.
+  clang::noteBottomOfStack(/*ForceSet=*/true);
+  bool success = instance->ExecuteAction(*action);
+  return success ? 0 : 1;
+}
+
+// Runs a clang driver command line that has exactly one compile job, or with
+// -### prints its jobs. Under gLock.
+int runClangDriver(llvm::ArrayRef<const char *> argv, llvm::raw_ostream &errOS,
+                   const std::atomic<bool> &flag) {
+  namespace opts = clang::driver::options;
+  unsigned missingIndex = 0, missingCount = 0;
+  llvm::opt::InputArgList parsed = clang::driver::getDriverOptTable().ParseArgs(
+      argv.slice(1), missingIndex, missingCount);
+  bool printJobs = false, hasResourceDir = false;
+  std::vector<bool> dropped(argv.size(), false);
+  for (const llvm::opt::Arg *A : parsed) {
+    if (A->getOption().matches(opts::OPT__HASH_HASH_HASH)) {
+      // Handled here: the driver would print its version to stderr.
+      printJobs = true;
+      dropped[A->getIndex() + 1] = true;
+      continue;
+    }
+    if (A->getOption().matches(opts::OPT_resource_dir))
+      hasResourceDir = true;
+    std::string option = rejectedDriverOption(*A, parsed);
+    if (!option.empty()) {
+      writeClangError(errOS, "swifthost_clang does not support " + option);
+      return 1;
+    }
+  }
+  if (!hasResourceDir) {
+    writeClangError(errOS, "swifthost_clang needs -resource-dir (the SDK's "
+                           "swift.xctoolchain/usr/lib/swift_static/clang)");
+    return 1;
+  }
+  std::string unsupported = rejectedDriverCommand(argv, parsed);
+  if (!unsupported.empty()) {
+    writeClangError(errOS, unsupported);
+    return 1;
+  }
+
+  // No configuration file is read: they are looked for next to the
+  // executable, which for argv[0] without a directory is the working
+  // directory.
+  llvm::SmallVector<const char *, 256> driverArgs;
+  driverArgs.push_back(argv[0]);
+  driverArgs.push_back("--no-default-config");
+  for (size_t i = 1; i < argv.size(); ++i)
+    if (!dropped[i])
+      driverArgs.push_back(argv[i]);
+
+  std::unique_ptr<clang::DiagnosticOptions> diagOpts =
+      clang::CreateAndPopulateDiagOpts(driverArgs);
+  diagOpts->DiagnosticSuppressionMappingsFile.clear();
+  // Colors only when asked for: by default the driver decides by whether the
+  // process's stderr is a terminal (and passes that on to cc1), but the
+  // diagnostics go to err_fd.
+  const llvm::opt::Arg *color = parsed.getLastArg(
+      opts::OPT_fcolor_diagnostics, opts::OPT_fno_color_diagnostics,
+      opts::OPT_fdiagnostics_color_EQ);
+  if (!color || (color->getOption().matches(opts::OPT_fdiagnostics_color_EQ) &&
+                 llvm::StringRef(color->getValue()) != "always"))
+    diagOpts->ShowColors = false;
+  auto *printer = new clang::TextDiagnosticPrinter(errOS, *diagOpts);
+  printer->setPrefix(llvm::sys::path::stem(argv[0]).str());
+  clang::DiagnosticsEngine diags(clang::DiagnosticIDs::create(), *diagOpts,
+                                 printer);
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fileSystem =
+      llvm::vfs::createPhysicalFileSystem();
+  clang::ProcessWarningOptions(diags, *diagOpts, *fileSystem,
+                               /*ReportDiags=*/false);
+  clang::driver::Driver driver(argv[0], kClangDefaultTriple, diags,
+                               "clang LLVM compiler", fileSystem);
+  driver.setTargetAndMode(
+      clang::driver::ToolChain::getTargetAndModeFromProgramName(argv[0]));
+  std::unique_ptr<clang::driver::Compilation> compilation(
+      driver.BuildCompilation(driverArgs));
+  if (!compilation || compilation->containsError() || diags.hasErrorOccurred())
+    return 1;
+
+  const clang::driver::JobList &jobs = compilation->getJobs();
+  if (printJobs) {
+    driver.PrintVersion(*compilation, errOS);
+    jobs.Print(errOS, "\n", /*Quote=*/true);
+    errOS.flush();
+    return 0;
+  }
+  if (jobs.size() != 1) {
+    writeClangError(errOS, "swifthost_clang runs exactly one compile job; "
+                           "this command needs " +
+                               llvm::Twine((unsigned)jobs.size()) + " jobs");
+    return 1;
+  }
+  const clang::driver::Command &job = *jobs.begin();
+  const llvm::opt::ArgStringList &jobArgs = job.getArguments();
+  for (const clang::driver::InputInfo &input : job.getInputInfos())
+    if (!isSupportedDriverInput(input.getType())) {
+      writeClangError(errOS,
+                      llvm::Twine("swifthost_clang does not support the input ") +
+                          input.getAsString() +
+                          " (only C sources and preprocessed C)");
+      return 1;
+    }
+  if (jobArgs.empty() || llvm::StringRef(jobArgs[0]) != "-cc1") {
+    writeClangError(errOS,
+                    llvm::Twine("swifthost_clang runs exactly one compile "
+                                "job; this command needs a job of ") +
+                        job.getCreator().getName());
+    return 1;
+  }
+  return runClangFrontend(jobArgs, argv[0], errOS, flag);
+}
+
+// A clang call: response files expanded as clang's main does, then the -cc1
+// passthrough or the driver. Under gLock.
+int runClang(int argc, const char **argv, llvm::raw_ostream &errOS,
+             const std::atomic<bool> &flag) {
+  llvm::BumpPtrAllocator allocator;
+  llvm::SmallVector<const char *, 256> args(argv, argv + argc);
+  llvm::cl::ExpansionContext expansion(allocator,
+                                       llvm::cl::TokenizeGNUCommandLine);
+  if (llvm::Error error = expansion.expandResponseFiles(args)) {
+    writeClangError(errOS, llvm::toString(std::move(error)));
+    return 1;
+  }
+  if (args.size() >= 2 && llvm::StringRef(args[1]) == "-cc1")
+    return runClangFrontend(llvm::ArrayRef<const char *>(args).slice(1),
+                            args[0], errOS, flag);
+  return runClangDriver(args, errOS, flag);
+}
+
 #if SWIFTHOST_SOURCEKIT
 // sourcekitd's crash containment. sourcekitd runs its work on its own threads
 // (libdispatch workers, 8 MB threads for stack-deep work, the main queue);
@@ -955,6 +1666,30 @@ extern "C" int swifthost_swift_frontend(int argc, const char **argv,
               (void *)(intptr_t)&swifthost_swift_frontend, &observer, diagOS);
         },
         poison);
+    {
+      std::lock_guard<std::mutex> lock(gCancelLock);
+      gCancelFlag.reset();
+    }
+    if (rc != 0 && !poison && flag->load(std::memory_order_relaxed))
+      return SWIFTHOST_ECANCELED;
+    return rc;
+  });
+}
+
+extern "C" int swifthost_clang(int argc, const char **argv, int out_fd,
+                               int err_fd) {
+  (void)out_fd;
+  if (argc < 1 || !argv)
+    return 2;
+  return runGuarded(ThreadRole::CCompiler, argc, argv, err_fd, [&](bool &poison) {
+    FdStream diagOS(err_fd, /*unbuffered=*/true);
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    {
+      std::lock_guard<std::mutex> lock(gCancelLock);
+      gCancelFlag = flag;
+    }
+    int rc = runRecovering([&] { return runClang(argc, argv, diagOS, *flag); },
+                           poison);
     {
       std::lock_guard<std::mutex> lock(gCancelLock);
       gCancelFlag.reset();

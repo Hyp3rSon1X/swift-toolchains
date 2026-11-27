@@ -170,8 +170,9 @@ typedef struct {
   char *diag;
 } Build;
 
-/* Full build of src with the job recipe. extra = frontend extras (NULL-terminated). */
-static Build build(const char *src, const char *tag, const char **extra) {
+/* Full build of src with the job recipe. extra = frontend extras, objs =
+   further objects for the link (both NULL-terminated or NULL). */
+static Build buildObjs(const char *src, const char *tag, const char **extra, const char **objs) {
   Build b = {0};
   char *obj = fmt("%s/%s.o", WORK, tag);
   char *al = fmt("%s/%s.autolink", WORK, tag);
@@ -212,6 +213,8 @@ static Build build(const char *src, const char *tag, const char **extra) {
   add(&ld, fmt("%s/WASI.sdk/lib/wasm32-wasip1/crt1-command.o", SDK));
   add(&ld, fmt("%s/wasi/wasm32/swiftrt.o", SW));
   add(&ld, obj);
+  for (; objs && *objs; ++objs)
+    add(&ld, *objs);
   char *lines = readFile(al);
   for (char *save = NULL, *l = strtok_r(lines, "\n", &save); l;
        l = strtok_r(NULL, "\n", &save))
@@ -232,6 +235,10 @@ static Build build(const char *src, const char *tag, const char **extra) {
   b.ld = nowMs() - t0;
   b.stage = 3;
   return b;
+}
+
+static Build build(const char *src, const char *tag, const char **extra) {
+  return buildObjs(src, tag, extra, NULL);
 }
 
 /* Runs the module in WAMR, returns its stdout (caller frees). With iwasm "-"
@@ -501,6 +508,89 @@ static void checkExecutablePlugins(void) {
   }
 }
 
+/* One C file through swifthost_clang (the C targets of a package). */
+static int clangCompile(const char *src, const char *obj, const char *inc, const char *opt,
+                        const char *tag, char **diag) {
+  Args a = {0};
+  add(&a, "clang");
+  add(&a, "-target"); add(&a, "wasm32-unknown-wasip1");
+  add(&a, "--sysroot"); add(&a, fmt("%s/WASI.sdk", SDK));
+  add(&a, "-resource-dir"); add(&a, fmt("%s/clang", SW));
+  add(&a, opt);
+  add(&a, "-I"); add(&a, inc);
+  add(&a, "-MD"); add(&a, "-MF"); add(&a, fmt("%s.d", obj));
+  add(&a, "-c"); add(&a, src);
+  add(&a, "-o"); add(&a, obj);
+  return call(swifthost_clang, &a, tag, diag);
+}
+
+static const char *CLANG_EXPECT = "c says 42\n";
+
+/* swifthost_clang: a C module (header, module map, source) compiled
+   in-process, imported by a Swift main and linked with it; then a clang call
+   cancelled after 100 ms of its CPU time (20,000 functions at -O0 take a few
+   hundred ms to parse), which must report only "compilation cancelled" and
+   leave the older object alone, and a clang call after it. */
+static void checkClang(void) {
+  char *dir = fmt("%s/cmod", WORK), *inc = fmt("%s/cmod/include", WORK);
+  mkdir(dir, 0755);
+  mkdir(inc, 0755);
+  writeFile(fmt("%s/cadd.h", inc), "int cadd(int a, int b);\n");
+  writeFile(fmt("%s/module.modulemap", inc), "module CAdd {\n  header \"cadd.h\"\n  export *\n}\n");
+  char *src = fmt("%s/cadd.c", dir), *obj = fmt("%s/cadd.o", dir);
+  writeFile(src, "#include \"cadd.h\"\nint cadd(int a, int b) { return a * 10 + b; }\n");
+  char *diag = NULL;
+  double t0 = nowMs();
+  int rc = clangCompile(src, obj, inc, "-O2", "clang-cadd", &diag);
+  printf("%-24s rc %3d  clang %6.0f ms\n", "clang-cadd", rc, nowMs() - t0);
+  CHECK(rc == 0 && diag && !*diag, "clang: rc %d, diagnostics: %s", rc, diag ? diag : "(null)");
+
+  char *mainSrc = fmt("%s/cmain.swift", dir);
+  writeFile(mainSrc, "import CAdd\nprint(\"c says\", cadd(4, 2))\n");
+  const char *incArgs[] = {"-I", inc, NULL};
+  const char *objs[] = {obj, NULL};
+  Build b = buildObjs(mainSrc, "clang-swift-main", incArgs, objs);
+  report("clang-swift-main", &b);
+  CHECK(b.rc == 0, "Swift main with the C module failed");
+  if (!b.rc) {
+    char *out = runWasm("clang-swift-main");
+    CHECK(!out || !strcmp(out, CLANG_EXPECT), "clang-swift-main output %s", out);
+  }
+
+  char *many = fmt("%s/many.c", dir), *manyObj = fmt("%s/many.o", dir);
+  FILE *f = fopen(many, "w");
+  for (int i = 0; i < 20000; ++i)
+    fprintf(f, "unsigned f%d(unsigned x) { unsigned y = x * %du; for (unsigned k = 0; k < (x & 7u); ++k) y ^= y << 3; return y; }\n",
+            i, 2 * i + 1);
+  fclose(f);
+  writeFile(manyObj, "OLD OBJECT\n");
+  CpuCancelCtx cc = {.cpuMs = 100, .thread = pthread_mach_thread_np(pthread_self())};
+  atomic_init(&cc.done, 0);
+  pthread_t ct;
+  pthread_create(&ct, NULL, cpuCanceller, &cc);
+  t0 = nowMs();
+  rc = clangCompile(many, manyObj, inc, "-O0", "clang-cancelled", &diag);
+  double returnedAt = nowMs(), cpuAtReturn = threadCpuMs(cc.thread);
+  atomic_store(&cc.done, 1);
+  pthread_join(ct, NULL);
+  int fired = cc.requestedAt > 0 && cc.requestedAt <= returnedAt;
+  printf("%-24s rc %3d  clang %6.0f ms\n", "clang-cancelled", rc, returnedAt - t0);
+  if (fired)
+    printf("  cancel latency %.0f ms, %.0f ms of CPU\n", returnedAt - cc.requestedAt, cpuAtReturn - cc.cpuAtRequest);
+  CHECK(fired, "cancelled clang call: the call returned before the cancel was requested");
+  CHECK(rc == SWIFTHOST_ECANCELED, "cancelled clang call: rc %d (expected %d)", rc, SWIFTHOST_ECANCELED);
+  CHECK(rc != SWIFTHOST_ECANCELED || onlyCancellation(diag),
+        "cancelled clang call: diagnostics other than \"compilation cancelled\":\n%s", diag);
+  char *old = readFile(manyObj);
+  CHECK(old && !strcmp(old, "OLD OBJECT\n"), "cancelled clang call changed the object at its -o path");
+  CHECK(!fired || returnedAt - cc.requestedAt < 500, "clang cancel took %.0f ms (bound 500 ms)",
+        returnedAt - cc.requestedAt);
+
+  rc = clangCompile(src, obj, inc, "-O2", "clang-after-cancel", &diag);
+  printf("%-24s rc %3d\n", "clang-after-cancel", rc);
+  CHECK(rc == 0, "clang call after a cancelled one: rc %d", rc);
+}
+
 static void *worker(void *unused) {
   (void)unused;
   SigSnap before, after;
@@ -734,6 +824,8 @@ static void *worker(void *unused) {
     char *out = runWasm("after-cancel");
     CHECK(!out || !strcmp(out, HELLO_EXPECT), "after-cancel output %s", out);
   }
+
+  checkClang();
 
   snap(&after);
   snapDiff(&before, &after, "after the builds");

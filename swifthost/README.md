@@ -9,7 +9,8 @@ It compiles against the official swift.org Swift SDK for WebAssembly, `swift-6.4
 (artifactbundle SHA-256 `83baca83553f8c443cda7b84800912e6e709c3acd2e7ebf277794ca5836c0da5`), which the app ships
 or downloads itself. Programs can use the standard library, Foundation (FoundationEssentials,
 FoundationInternationalization), Observation's runtime, Synchronization, RegexBuilder and the other modules in that
-SDK. Macros work through an in-process plugin server that the app provides (see Macros).
+SDK. Macros work through an in-process plugin server that the app provides (see Macros). Since -9 it also compiles
+the C targets of packages to WebAssembly objects (`swifthost_clang`, see C targets).
 
 ## Contents
 
@@ -27,7 +28,7 @@ SDK. Macros work through an in-process plugin server that the app provides (see 
 
 Each `libSwiftHostCompiler.a` holds one prelinked object: the compiler, clang (as the Swift compiler's C importer),
 LLVM with only the WebAssembly backend, and lld's wasm linker, linked together (`ld -r`) and with every symbol
-hidden except the seven `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
+hidden except the eight `swifthost_*` functions. LLVM, clang or Swift symbols in the app or in other libraries
 cannot clash with it.
 
 ## Linking
@@ -55,7 +56,7 @@ See `SwiftHostCompiler.h` for the contract and `JOBS.txt` for the jobs. In short
 
 1. Run every call on a thread with at least `SWIFTHOST_MIN_STACK_SIZE` (16 MiB) of stack, not on the main thread.
 2. Compile with `swifthost_swift_frontend`, extract the autolink entries with `swifthost_swift_autolink_extract`,
-   link with `swifthost_wasm_ld`. Each takes an argv and two file descriptors (output, diagnostics) and returns the
+   link with `swifthost_wasm_ld`; compile the C sources of package C targets with `swifthost_clang`. Each takes an argv and two file descriptors (output, diagnostics) and returns the
    tool's exit status.
 3. Pass `-module-cache-path` to a writable directory that survives between builds (for example in Caches).
 4. If a call returns `SWIFTHOST_EPOISONED` (125), the compiler crashed in this process (in this call or an earlier
@@ -130,6 +131,36 @@ awaits still overflow the stack.
 
 Without the flag, the compiler generates the same code as `swifthost-6.4.2-2`, except that the `swift_task_switch`
 and `swift_asyncLet_finish` declarations carry the `swiftasync` attribute.
+
+## C targets
+
+`swifthost_clang` (since -9) compiles one C source file per call to a WebAssembly object with the library's clang,
+for the C targets of packages (for example `_NumericsShims`, `_AtomicsShims`, swift-markdown's `CAtomic` and
+`cmark-gfm`, swift-syntax's `_SwiftSyntaxCShims`). It takes clang driver arguments for exactly one compile job, as
+SwiftPM's native build system passes them, plus `-resource-dir` (the SDK's `swift_static/clang`) and the toolset's C
+flags; `JOBS.txt` has the full argument list under "C compile jobs" and the header the contract. With the same
+sources and flags the objects are byte-identical to the stand-alone clang's. Only C and preprocessed C are accepted:
+C++, Objective-C, assembler and LLVM IR inputs, options that spawn, load code or write to the process's standard
+streams, and commands that need more than one job are rejected with one error line. A running call is cancelled by
+`swifthost_request_cancel()` like a frontend call.
+
+## Changes in swifthost-6.4.2-9
+
+- New entry point `swifthost_clang`: an in-process C compiler for the C targets of packages (see C targets). It needs
+  no compiler change: the clang driver, code generation and the WebAssembly backend were already in the library for
+  the Swift compiler's C importer. Each slice grows by about 0.1 MB.
+- Cancellation of a clang call: at every top-level declaration while parsing, before every optimization pass, and in
+  code generation at its next function, pass or block. Measured cancel-to-return latency (CPU time): medians of
+  10-40 ms while parsing and in code generation, 100-170 ms in optimization, up to about 0.5 s when one
+  optimization pass works on one function of 20,000 statements. A cancelled call returns 124 with the one diagnostic
+  `compilation cancelled` and writes no object; it does rewrite the `-MD` dependency file (see the header).
+- Tested with the 31 C files of the five targets above (SwiftPM 6.4.2's lines for the
+  `swifthost-sdk-wasip1-threads-6.4.2-6` SDK, debug and release), three passes in one process: objects and dependency
+  files byte-identical to the stand-alone clang built from the same sources; against the swift.org-style toolchain
+  clang only the embedded version string differs. A Swift program that calls into all five, compiled and linked
+  in-process, runs in WAMR.
+- The Swift compiler, sourcekitd, wasm-ld and their output are unchanged from -8: same fork commits, same API for
+  the other entry points, and the macro module and swift-syntax version are the same.
 
 ## Changes in swifthost-6.4.2-8
 
@@ -291,6 +322,7 @@ contract. In short:
 ## Limits
 
 - One call at a time per process (calls are serialized internally).
+- `swifthost_clang` compiles C only (C++ is planned), one source file per call.
 - No macro implementations are included (`@Observable`, `#Predicate`, `#expect`, ...): the app serves them (see
   Macros). A macro whose module no plugin serves is an ordinary compile error (return value 1), for example:
   `error: external macro implementation type 'ObservationMacros.ObservableMacro' could not be found for macro

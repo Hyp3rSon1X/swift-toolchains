@@ -156,6 +156,55 @@ stack ended in an unrelated trap in WAMR; with `--stack-first` the same
 program trapped with "out of bounds memory access" at the overflow.
 `--global-base` must be at least the stack size in this mode.
 
+C compile jobs (swifthost_clang)
+--------------------------------
+
+The C targets of a package (C only for now; C++ is untested) compile one
+source file per call into one object, which then goes on the wasm-ld line
+after $OBJ. This is the line SwiftPM runs for a C file, plus -resource-dir
+(argv[0] is no real path in the app, so clang cannot find its headers next
+to it); for the threads SDK (wasm32-unknown-wasip1-threads):
+
+  clang
+  -target wasm32-unknown-wasip1-threads
+  --sysroot $SDK/WASI.sdk
+  -resource-dir $SW/clang
+  -O0 -DDEBUG=1 (debug) or -O2 (release)
+  -DSWIFT_PACKAGE=1
+  -fblocks
+  -I <each include directory of the target and its dependencies>
+  -matomics -mbulk-memory -mthread-model posix -pthread -ftls-model=local-exec
+  (the threads SDK's toolset flags; the tail-call bundle adds -mtail-call)
+  -g
+  -w
+  -MD -MT dependencies -MF <file>.c.d
+  -c <file>.c
+  -o <file>.c.o
+
+Debug builds may add -index-store-path <dir> (SwiftPM does). -target (a
+WebAssembly target), --sysroot and -resource-dir are required (without
+-target the library compiles for wasm32-unknown-wasip1, never for the host;
+a missing -resource-dir is an error). Inputs: C sources (.c, -x c) and
+preprocessed C (.i, -x cpp-output) only; argv[0] must be "clang" (not
+"clang++"). One call runs exactly one compile job: two source files with -c
+and a command without -c (it would link) are errors (return value 1).
+`-###` writes the cc1 command line to err_fd and runs nothing; argv[0]
+"clang", argv[1] "-cc1" and the rest of that line run it directly. Response
+files (@file) are expanded. Rejected with one error line and return value 1:
+any argument whose value names standard input or output ("-",
+/dev/stdout, /dev/fd/N, ...; /dev/null is fine), options that
+print to the process's stdout or stderr (-v, --version, -help, -print-*,
+-dumpmachine, -dumpversion, -ccc-print-*, -H, -ftime-report, some cc1 dump
+options), that run more than the compile (-save-temps), that load code
+(-fplugin=, -fpass-plugin=, -Xclang -load/-plugin/-add-plugin), GPU
+offloading (--offload-arch=, CUDA, HIP, -fopenmp (-fopenmp-simd is fine),
+SYCL), -ObjC,
+--driver-mode=, configuration files (--config), -MJ, -fno-temp-file,
+-ftime-trace and the compilation cache. The full list is in
+SwiftHostCompiler.h; -Xclang passes other cc1 options through unchecked, so
+pass only cc1 options that you have tested. With the same compiler sources
+and flags the objects are byte-identical to the stand-alone clang's.
+
 Running the output
 ------------------
 
@@ -167,8 +216,8 @@ Return values
 -------------
 
 0 = success. Compile errors return 1 with diagnostics on err_fd. 124 =
-SWIFTHOST_ECANCELED (swifthost_request_cancel() stopped this frontend call;
-the library stays usable). 125 = SWIFTHOST_EPOISONED (the compiler crashed in
+SWIFTHOST_ECANCELED (swifthost_request_cancel() stopped this frontend or clang
+call; the library stays usable). 125 = SWIFTHOST_EPOISONED (the compiler crashed in
 this process, in an earlier call or in this one; restart the process). 128+N =
 this call crashed with signal N (a stack overflow on the calling thread
 included) and was recovered. A crash on the compiler's helper thread (clang
