@@ -365,6 +365,8 @@ static void *cpuCanceller(void *p) {
 static const char *HELLO_EXPECT = "hi\n";
 static const char *FOUNDATION_EXPECT =
     "hi from Foundation 1970-01-01T00:00:00Z {\"n\":42} example.org\n";
+static const char *EXECUTOR_FACTORY_EXPECT =
+    "factory: mainExecutor\nfactory: defaultExecutor\nmain: start\nmain: 42\n";
 
 static double peakRssMiB(void) {
   struct rusage ru;
@@ -883,6 +885,18 @@ static void *worker(void *unused) {
     if (!b.rc) {
       char *out = runWasm(tag);
       CHECK(!out || !strcmp(out, FOUNDATION_EXPECT), "%s output %s", tag, out);
+    }
+  }
+
+  /* An async main installs the main module's DefaultExecutorFactory without
+     -disable-availability-checking (from -12). */
+  {
+    Build b = build(fmt("%s/executor_factory.swift", TESTS), "executor-factory", NULL);
+    report("executor-factory", &b);
+    CHECK(b.rc == 0, "executor-factory failed");
+    if (!b.rc) {
+      char *out = runWasm("executor-factory");
+      CHECK(!out || !strcmp(out, EXECUTOR_FACTORY_EXPECT), "executor-factory output %s", out);
     }
   }
 

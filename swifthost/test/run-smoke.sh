@@ -76,11 +76,12 @@ check_nospawn "$WORK/exec-plugin.stderr" || rc=1
 # The modules built in the simulator, run on the host.
 hello=$'hi'
 foundation='hi from Foundation 1970-01-01T00:00:00Z {"n":42} example.org'
-for w in "$WORK"/run/hello-onone-*.wasm "$WORK"/run/hello-after-errors.wasm "$WORK"/run/foundation-*.wasm \
+factory=$'factory: mainExecutor\nfactory: defaultExecutor\nmain: start\nmain: 42'
+for w in "$WORK"/run/hello-onone-*.wasm "$WORK"/run/hello-after-errors.wasm "$WORK"/run/foundation-*.wasm "$WORK"/run/executor-factory.wasm \
          "$WORK"/run/clang-swift-main.wasm "$WORK"/run/cxx-swift-main.wasm "$WORK"/run/macro-dylib.wasm "$WORK"/run/macro-reply-brackets.wasm "$WORK"/run/macro-after-bad-replies.wasm "$WORK"/run-plugin-handler/macro-handler*.wasm; do
   [[ -f $w ]] || continue
   out=$("$IWASM" "$w")
-  case $(basename "$w") in hello*) want=$hello;; macro*) want=42;; clang*) want='c says 42';; cxx*) want='c++ says 42';; *) want=$foundation;; esac
+  case $(basename "$w") in hello*) want=$hello;; executor-factory*) want=$factory;; macro*) want=42;; clang*) want='c says 42';; cxx*) want='c++ says 42';; *) want=$foundation;; esac
   if [[ $out == "$want" ]]; then echo "host run ok: $(basename "$w")"; else echo "FAIL host run $(basename "$w"): $out"; rc=1; fi
 done
 exit $rc

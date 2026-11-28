@@ -155,6 +155,19 @@ libc++abi has no exception runtime, while clang turns C++ exceptions on by defau
 throwing part of libc++ (`std::map::at`, `std::function`, ...), links only when compiled with `-fno-exceptions`. The
 threads SDK from `-7` passes `-fno-exceptions` for C++ in its toolset, so SwiftPM builds need no manifest flag there.
 
+## Changes in swifthost-6.4.2-12
+
+- An async main entry point installs the main module's `DefaultExecutorFactory` (a top-level
+  `typealias DefaultExecutorFactory = ...` or one in the `@main` type) without `-disable-availability-checking`. Swift
+  6.4.2 emits the `swift_createExecutors(factory:)` call only when the custom-executor feature is available in the
+  runtime, which it marks as a future runtime version; for WebAssembly the call was therefore never emitted, and the
+  program stayed on the SDK's cooperative executor unless availability checking was turned off, which also hides real
+  availability errors. WebAssembly programs always link the Swift runtime of the SDK they are compiled against, so the
+  compiler now treats the function as available for WASI targets. A module without its own factory now installs
+  `PlatformExecutorFactory` when `main` starts instead of on first use; the executors are the same. A main module whose
+  `DefaultExecutorFactory` does not conform to `ExecutorFactory` now gets an error, as it already did with
+  `-disable-availability-checking`. Nothing else in the compiler, sourcekitd, `swifthost_clang` or wasm-ld changes.
+
 ## Changes in swifthost-6.4.2-11
 
 - `swifthost_clang` accepts `-fmodule-map-file=` again (driver and cc1), which -10 rejected with the other module
@@ -405,7 +418,7 @@ Built from public forks, on top of Swift 6.4.2:
 
 | Repository | Branch | Commit |
 |-|-|-|
-| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `fce936f5d677135d99c869ae8d36979343e7a65b` |
+| [Hyp3rSon1X/swift](https://github.com/Hyp3rSon1X/swift) | `hyp3r/ios-host/6.4.2` | `786691cd69d0ba221ded9028f3b8057352c063ee` |
 | [Hyp3rSon1X/llvm-project](https://github.com/Hyp3rSon1X/llvm-project) | `hyp3r/ios-host/6.4.2` | `6d8c598c2be47e43ebe2939f33678b184bfaf965` |
 | swiftlang/swift-cmark | tag `swift-6.4.2-RELEASE` | `924936d0427cb25a61169739a7660230bffa6ea6` |
 | swiftlang/swift-experimental-string-processing | tag `swift-6.4.2-RELEASE` | `7581e7b803d2ccc58409e45e1bfde40146cb8e41` |
@@ -503,6 +516,9 @@ The swift branch is `swift-6.4.2-RELEASE` plus the compiler fixes of `swift-6.4.
 - Cancel in code generation (from `swifthost-6.4.2-8`):
   - `[IRGen]` (`fce936f5d67`) fork only: the compilation's cancellation flag is attached around the LLVM code
     generation pass manager, and the temporary output is discarded when the compile was cancelled.
+- `[SILGen]` (from `swifthost-6.4.2-12`, `786691cd69d`) the async main entry point calls `swift_createExecutors` with the
+  configured executor factory on WASI targets without `-disable-availability-checking` (also in `swift-6.4.2-hyp3r.13`;
+  not upstream yet).
 
 The llvm-project branch is `swift-6.4.2-RELEASE` plus:
 
