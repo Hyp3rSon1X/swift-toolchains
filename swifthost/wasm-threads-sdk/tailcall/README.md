@@ -201,6 +201,10 @@ thread's priority.
   ran the module's constructors (`_start`, or `_initialize` in a reactor module).
 - The main executor is still the cooperative executor, which has no locks. A `DefaultExecutorFactory` that runs jobs on
   several pthreads must also provide its own `mainExecutor` (this was the same in `-7`).
+- Swift 6 language mode: top-level code in `main.swift` is `@MainActor`, and a closure written there inherits that
+  isolation, also as a `pthread_create` entry. The compiler checks the isolation at the closure's entry (SE-0423). Up to
+  `-7` the check passed on every thread; from `-8` it traps on the new pthread, as on Linux. Use a global function or a
+  `@Sendable` closure as the thread entry (`test/swift6_global_entry.swift`; `test/swift6_closure_entry.swift` traps).
 - `-8` differs from `-7` in one file, the threads `libswift_Concurrency.a`, and in it in one member, `Actor.cpp.o`. The
   Swift modules, interfaces, `libswiftCore.a`, the toolset and every other file are byte-identical. Code built against
   `-7` gets the change by relinking against `-8`.
@@ -286,8 +290,10 @@ Scripts:
   a `--fatal-warnings` link (no signature-mismatch warning allowed), runs both and prints `immortalize OK` when they
   pass. On `-4` the first link warns, the second fails, and the program traps.
 - `isolation.sh <swiftc> <threads-sdk-dir> <out-dir> <iwasm>` builds `wasi_threads_main_thread_isolation.swift` against
-  the SDK and runs it with `--max-threads=8`. `MainActor.assumeIsolated` must pass on the main thread and trap on a
-  pthread. It prints `isolation OK` when both hold; on `-7` the pthread passes and it prints `isolation FAILED`.
+  the SDK and runs it with `--max-threads=8`: `MainActor.assumeIsolated` must pass on the main thread and trap on a
+  pthread. In Swift 6 mode it also builds `swift6_closure_entry.swift` (a top-level closure as `pthread_create` entry,
+  must trap) and `swift6_global_entry.swift` (a global function, must run). It prints `isolation OK` when all hold; on
+  `-7` the pthreads pass and it prints `isolation FAILED`.
 - `validate.mjs <file.wasm>` compiles a module with V8. Its error names the function and the instruction, which is more
   precise than WAMR's loader message.
 
