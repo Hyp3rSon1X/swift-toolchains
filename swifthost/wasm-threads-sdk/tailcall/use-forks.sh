@@ -6,7 +6,7 @@
 set -euo pipefail
 W=${W:?set W to the build directory}
 HERE=$(cd "$(dirname "$0")" && pwd)
-SWIFT=6c40b6bc98c804e83d339a9db7e1538256dd5fbc
+SWIFT=fd5fcb133ad28ba1ac3036cae9a5afd9a120c753
 LLVM=11627bca6d44ea33b0fbb74d4c5c0e6c45acc087
 WASI_LIBC=85613c6915f511541354e6f285e6d6a59900581d
 sw() { # repo-dir fork-url commit

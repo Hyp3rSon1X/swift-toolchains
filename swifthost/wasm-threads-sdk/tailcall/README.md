@@ -22,10 +22,10 @@ The stack depth then stays flat: 10,000,000 awaits and 1,000,000 actor hops run 
 
 Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except for three repositories:
 
-- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `6c40b6bc98c804e83d339a9db7e1538256dd5fbc`.
-  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus four cherry-picks and three fixes of our own (the SDK `-4` was built from
-  `37591f512993731dc2a9739dfb2912fdf5d17775`, which lacks the last three, and `-5` from
-  `b906bfb4bb352e9c935b6750d23c533da9d6de70`, which lacks the last one):
+- `swift`: Hyp3rSon1X/swift, branch `hyp3r/wasm-sdk/6.4.2`, `fd5fcb133ad28ba1ac3036cae9a5afd9a120c753`.
+  It is `swift-6.4.2-RELEASE` (`83eb12448e4`) plus five cherry-picks and four fixes of our own (the SDK `-4` was built from
+  `37591f512993731dc2a9739dfb2912fdf5d17775`, `-5` from `b906bfb4bb352e9c935b6750d23c533da9d6de70` and `-6` from
+  `6c40b6bc98c804e83d339a9db7e1538256dd5fbc`; `-7` is `-6` with a new toolset):
   - `d7dcf221748b7fb3d9fbedb45fd6df20f5cc8748`, swiftlang/swift#88074, "Wasm: add tests for swiftasyncc tail calls".
     Tests only; the next pick's test edits need it.
   - `3c9966afca9c1e207dcf0b23b39971d81c3bdff6`, swiftlang/swift#93062, "[IRGen] Preserve async-context attributes in
@@ -42,6 +42,11 @@ Same as the parent recipe (`../fetch-src.sh`, tag `swift-6.4.2-RELEASE`), except
     convention" (new in `-5`, not yet upstream). See "Changes in -5".
   - `6c40b6bc98c804e83d339a9db7e1538256dd5fbc`, "[Serialization] Serialize differentiability witnesses in a deterministic order" (new in `-6`,
     not yet upstream). See "Changes in -6".
+  - `6a0ae441f208a87b837efa6f454bf85ab856ca61`, "[Serialization] Serialize functions referenced only by debug info in a
+    deterministic order" (not yet upstream). It is in the build since `-8` and changes no file of the bundle (it concerns
+    Embedded Swift modules, which the bundle does not have).
+  - `fd5fcb133ad28ba1ac3036cae9a5afd9a120c753` (cherry-picked from `8ddc55c72ba0d561b241cab475ca3fee8bac036c`),
+    swiftlang/swift#92018, "[wasm] Enable multi-threaded wasi-threads Concurrency" (new in `-8`). See "Changes in -8".
 - `llvm-project`: Hyp3rSon1X/llvm-project, branch `hyp3r/wasm-sdk/6.4.2`,
   `11627bca6d44ea33b0fbb74d4c5c0e6c45acc087`. It is `swift-6.4.2-RELEASE` (`fb5f84d903a3`) plus three cherry-picks:
   - `b9c55a400656eb43be1215828cee8f6eaa970e94`, swiftlang/llvm-project#12648 (a squash of llvm/llvm-project#188296
@@ -176,6 +181,36 @@ exceptions on by default, so ordinary C++ (`std::map::at`, `std::function`, ...)
 - `package.sh` now writes the same toolset, so a fresh build of the recipe gives the `-7` bundle contents.
 - The reference package `../test/cxx-reference` needs no manifest flag with `-7`.
 
+## Changes in -8
+
+`swifthost-sdk-wasip1-threads-6.4.2-8` lets the threads runtime tell the main pthread from other pthreads.
+Up to `-7` the threads stdlib was built with `SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY=TRUE`, the setting of the
+single-threaded WebAssembly targets, so the runtime took every pthread for the main thread. That did not matter while
+all Swift code ran on the main thread, but code on other pthreads passed every main-actor check: `MainActor.assumeIsolated`
+and the other dynamic isolation checks passed outside a task on any thread, and a `Task` created there got the main
+thread's priority.
+
+- The backport of swiftlang/swift#92018 builds the threads stdlib with `SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY=FALSE`
+  and keeps the cooperative global executor (`SWIFT_CONCURRENCY_GLOBAL_EXECUTOR=singlethreaded`). The runtime now
+  compares the current pthread with the main thread (`pthread_equal`). The plain `wasm32-unknown-wasip1` stdlib keeps
+  `TRUE`. 6.4.2 has no shared wasm helper and no Emscripten product, so the defines went into `wasistdlib.py`.
+- On a pthread other than the main thread, outside a task: `MainActor.assumeIsolated` traps with `Unexpected isolation
+  context, expected to be executing on CooperativeExecutor`, and the thread priority the runtime reports
+  there, which a new unstructured `Task` inherits, is `unspecified` instead of `userInitiated`. Inside a task, and on
+  the main thread, nothing changes. A program that starts no pthreads sees no change. The main thread is the thread that
+  ran the module's constructors (`_start`, or `_initialize` in a reactor module).
+- The main executor is still the cooperative executor, which has no locks. A `DefaultExecutorFactory` that runs jobs on
+  several pthreads must also provide its own `mainExecutor` (this was the same in `-7`).
+- `-8` differs from `-7` in one file, the threads `libswift_Concurrency.a`, and in it in one member, `Actor.cpp.o`. The
+  Swift modules, interfaces, `libswiftCore.a`, the toolset and every other file are byte-identical. Code built against
+  `-7` gets the change by relinking against `-8`.
+- New release asset `llvm-project-libcxx-Unicode-DFS-2016.txt`: four libc++ headers in the SDK
+  (`__format/escaped_output_table.h`, `width_estimation_table.h`, `extended_grapheme_cluster_table.h`,
+  `indic_conjunct_break_table.h`) carry the Unicode data license. The four notices are identical; the asset has the text.
+- The regression test is `test/Concurrency/Runtime/wasi_threads_main_thread_isolation.swift` in the swift fork commit
+  (upstream's test with the 6.4.2 diagnostic), copied here as `test/wasi_threads_main_thread_isolation.swift`.
+  `test/isolation.sh` is the SDK-level check.
+
 ## Steps (macOS arm64, Xcode 27.2, cmake and ninja on PATH)
 
 ```
@@ -250,6 +285,9 @@ Scripts:
 - `immortalize.sh <swiftc> <threads-sdk-dir> <out-dir> <iwasm>` builds `immortalize.swift` against the SDK with a plain and
   a `--fatal-warnings` link (no signature-mismatch warning allowed), runs both and prints `immortalize OK` when they
   pass. On `-4` the first link warns, the second fails, and the program traps.
+- `isolation.sh <swiftc> <threads-sdk-dir> <out-dir> <iwasm>` builds `wasi_threads_main_thread_isolation.swift` against
+  the SDK and runs it with `--max-threads=8`. `MainActor.assumeIsolated` must pass on the main thread and trap on a
+  pthread. It prints `isolation OK` when both hold; on `-7` the pthread passes and it prints `isolation FAILED`.
 - `validate.mjs <file.wasm>` compiles a module with V8. Its error names the function and the instruction, which is more
   precise than WAMR's loader message.
 
